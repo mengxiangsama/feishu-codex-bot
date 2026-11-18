@@ -5,6 +5,12 @@ import { dirname, resolve } from 'node:path';
 const MAX_PROCESSED = 2000;
 const MAX_TEXT = 12000;
 const HELP = '直接发送文字任务即可连续对话。\n/new — 开始新对话\n/status — 查看状态\n/help — 查看帮助\n电脑和本地程序需要保持运行。';
+const TEAM_COMMAND = /^\/协作(?:\s+([\s\S]*))?$/;
+const TEAM_FAILURES = new Map([
+  ['TEAM_PLAN_FAILED', '负责人规划未完成'],
+  ['TEAM_EXECUTE_FAILED', '执行者未完成任务'],
+  ['TEAM_REVIEW_FAILED', '负责人审查未完成'],
+]);
 
 function freshState() {
   return { version: 1, ownerOpenId: null, pairingCode: randomBytes(6).toString('hex'), sessions: {}, processed: [] };
@@ -30,10 +36,15 @@ function validateState(value) {
 
 /** Routes Feishu events to one local Codex worker. No message text is persisted. */
 export class Bot {
-  constructor({ stateFile, runner, messenger, botName, persona, logger = console, maxQueue = 8 }) {
+  constructor({ stateFile, runner, messenger, botName, persona, teamRunner, teamChatId,
+    teamWorkerLabel, logger = console, maxQueue = 8 }) {
     if (!stateFile || !runner?.run || !runner?.cancel || !messenger?.reply ||
         !Number.isInteger(maxQueue) || maxQueue < 1) {
       throw new Error('机器人配置不完整。');
+    }
+    if (teamRunner != null && (typeof teamRunner.run !== 'function' || typeof teamRunner.cancel !== 'function' ||
+        typeof teamChatId !== 'string' || !teamChatId.trim())) {
+      throw new Error('协作配置不完整。');
     }
     this.stateFile = resolve(stateFile);
     this.runner = runner;
@@ -41,8 +52,12 @@ export class Bot {
     this.botName = typeof botName === 'string' ? botName.trim() : '';
     this.persona = typeof persona === 'string' ? persona.trim() : '';
     this.workerLabel = this.botName || '本机 Codex';
+    this.teamRunner = teamRunner;
+    this.teamChatId = teamChatId;
+    this.teamWorkerLabel = (typeof teamWorkerLabel === 'string' ? teamWorkerLabel.trim() : '') || '执行机器人';
     const stopHelp = '/stop — 停止当前会话的本机 Codex 进程，并清空其等待队列。';
-    this.helpText = `你正在与 ${this.workerLabel} 对话，任务由本机 Codex 处理。${HELP}\n${stopHelp}`;
+    const teamHelp = teamRunner ? '\n/协作 任务描述 — 在指定群 @ 我，开启规划、执行和审查。' : '';
+    this.helpText = `你正在与 ${this.workerLabel} 对话，任务由本机 Codex 处理。${HELP}\n${stopHelp}${teamHelp}`;
     this.logger = logger;
     this.maxQueue = maxQueue;
     this.queue = [];
@@ -82,8 +97,8 @@ export class Bot {
     }
   }
 
-  log(message) {
-    try { this.logger?.error?.(message); } catch { /* Logging must not break event acknowledgement. */ }
+  log(message, level = 'error') {
+    try { this.logger?.[level]?.(message); } catch { /* Logging must not break event acknowledgement. */ }
   }
 
   reply(messageId, text) {
@@ -101,11 +116,17 @@ export class Bot {
   failState(messageId) {
     this.failed = true;
     this.queue = [];
-    if (this.current) this.current.cancelled = true;
-    try { this.runner.cancel(); } catch { /* The worker may already have exited. */ }
+    this.cancelCurrentJob();
     this.log('本地状态保存失败，已停止接受本机 Codex 任务。');
     if (messageId) void this.reply(messageId, '本地状态保存失败，任务已停止。请在电脑上检查状态文件权限后重启程序。');
     this.notifyIdle();
+  }
+
+  cancelCurrentJob() {
+    if (!this.current) return;
+    this.current.cancelled = true;
+    const runner = this.current.team ? this.teamRunner : this.runner;
+    try { runner.cancel(); } catch { /* The worker may already have exited. */ }
   }
 
   /** Intentionally returns immediately: SDK event acknowledgement must not await a task. */
@@ -177,6 +198,8 @@ export class Bot {
     }
 
     const key = JSON.stringify([message.chat_id, senderId]);
+    const teamCommand = TEAM_COMMAND.exec(text);
+    const teamTask = teamCommand?.[1]?.trim();
     if (/^\/pair(?:\s|$)/i.test(text)) {
       void this.reply(messageId, '你已完成绑定，无需重复绑定。');
     } else if (text === '/help') {
@@ -190,13 +213,16 @@ export class Bot {
       this.queue = this.queue.filter(job => job.key !== key);
       const removed = before - this.queue.length;
       const active = this.current?.key === key;
-      if (active) {
-        this.current.cancelled = true;
-        try { this.runner.cancel(); } catch { /* The worker may already have exited. */ }
-      }
+      if (active) this.cancelCurrentJob();
       const stopped = `已停止当前会话的本机 Codex 进程，并取消 ${removed} 条等待任务。`;
       void this.reply(messageId, active || removed ? stopped : '当前会话没有正在执行或等待的任务。');
       this.notifyIdle();
+    } else if (teamCommand && !this.teamRunner) {
+      void this.reply(messageId, '请在指定群 @ 负责人，并发送 /协作 任务描述。');
+    } else if (teamCommand && (message.chat_type !== 'group' || message.chat_id !== this.teamChatId)) {
+      void this.reply(messageId, '协作仅在配置的群聊中可用，请在该群 @ 我。');
+    } else if (teamCommand && !teamTask) {
+      void this.reply(messageId, `请在 /协作 后写任务，例如：@${this.workerLabel} /协作 写一份机器人使用说明。`);
     } else if (!text) {
       void this.reply(messageId, '请发送文字任务，或发送 /help 查看命令。');
     } else if (text.length > MAX_TEXT) {
@@ -204,7 +230,9 @@ export class Bot {
     } else if (this.queue.length + (this.current ? 1 : 0) >= this.maxQueue) {
       void this.reply(messageId, '等待队列已满，请稍后再发送任务。');
     } else {
-      this.queue.push({ messageId, key, text, reset: text === '/new', cancelled: false });
+      this.queue.push({
+        messageId, key, text: teamTask ?? text, team: Boolean(teamCommand), reset: text === '/new', cancelled: false,
+      });
       this.scheduleDrain();
     }
   }
@@ -243,10 +271,16 @@ export class Bot {
       await this.reply(job.messageId, `已开始新对话。接下来发送的任务会使用新的 ${this.workerLabel} 会话。`);
       return;
     }
-    await this.reply(job.messageId, `已收到，正在由${this.workerLabel}处理。`);
+    await this.reply(job.messageId, job.team
+      ? `已收到协作任务。${this.workerLabel} 正在规划，随后由 ${this.teamWorkerLabel} 执行。`
+      : `已收到，正在由${this.workerLabel}处理。`);
     if (job.cancelled || this.closed || this.failed) return;
     // Confirm persistence is still writable immediately before submitting a task.
     try { this.persist(); } catch { this.failState(job.messageId); return; }
+    if (job.team) {
+      await this.processTeamJob(job);
+      return;
+    }
     try {
       const result = await this.runner.run({
         prompt: this.persona ? `机器人角色配置：\n${this.persona}\n\n飞书用户消息：\n${job.text}` : job.text,
@@ -279,6 +313,42 @@ export class Bot {
     }
   }
 
+  async processTeamJob(job) {
+    const stages = {
+      execute: `规划已完成，${this.teamWorkerLabel} 正在执行。`,
+      review: `执行已完成，${this.workerLabel} 正在审查结果。`,
+    };
+    this.log('协作开始：规划/执行/审查。', 'info');
+    try {
+      const result = await this.teamRunner.run({
+        prompt: job.text,
+        onStage: async stage => {
+          if (job.cancelled || this.closed || this.failed || !Object.hasOwn(stages, stage)) return;
+          await this.reply(job.messageId, stages[stage]);
+        },
+      });
+      if (job.cancelled || this.closed || this.failed) return;
+      if (typeof result?.text !== 'string' || !result.text.trim()) {
+        await this.reply(job.messageId, '协作任务已结束，负责人未返回文字结果。');
+        return;
+      }
+      if (await this.reply(job.messageId, `协作汇报\n${result.text}`)) {
+        this.log('协作完成，结果已回复飞书。', 'info');
+      }
+    } catch (error) {
+      if (job.cancelled || this.closed || this.failed) return;
+      if (error?.code === 'TEAM_CANCELLED') {
+        await this.reply(job.messageId, '协作任务已取消。');
+        return;
+      }
+      this.log('协作执行失败，请在本机检查 Codex 运行状态。');
+      const reason = TEAM_FAILURES.get(error?.code);
+      await this.reply(job.messageId, reason
+        ? `协作未完成：${reason}。请检查本机运行状态，或稍后重新发送。`
+        : '协作未完成。请检查本机运行状态，或稍后重新发送。');
+    }
+  }
+
   notifyIdle() {
     if (this.draining || this.scheduled || this.queue.length || this.pendingReplies.size) return;
     for (const resolveIdle of this.idleWaiters) resolveIdle();
@@ -293,8 +363,7 @@ export class Bot {
   async close() {
     this.closed = true;
     this.queue = [];
-    if (this.current) this.current.cancelled = true;
-    try { this.runner.cancel(); } catch { /* The worker may already have exited. */ }
+    this.cancelCurrentJob();
     this.notifyIdle();
     await this.idle();
   }

@@ -9,6 +9,7 @@ import { Bot } from './bot.mjs';
 import { codexExecutable, ensureLocalDir, loadMappings, localDir, projectDir, saveMappings, validateMapping } from './config.mjs';
 import { connectFeishu, makeMessenger } from './feishu.mjs';
 import { CodexRunner, REASONING_EFFORTS } from './codex-runner.mjs';
+import { TeamRunner } from './team-runner.mjs';
 
 const [, , command = 'help', selector] = process.argv;
 
@@ -126,9 +127,41 @@ function acquireLock() {
   process.once('exit', () => rmSync(path, { force: true }));
 }
 
+function loadTeam(mappings) {
+  try {
+    const team = JSON.parse(readFileSync(join(localDir, 'team.json'), 'utf8'));
+    const leader = mappings.find(({ appId }) => appId === team.leaderAppId);
+    const worker = mappings.find(({ appId }) => appId === team.workerAppId);
+    if (team.version !== 1 || typeof team.chatId !== 'string' || !/^oc_[A-Za-z0-9]+$/.test(team.chatId) ||
+        !leader || !worker || leader.appId === worker.appId) {
+      throw new Error('invalid team');
+    }
+    const makeRunner = (bot, sandbox) => ({ workspace }) => new CodexRunner({
+      codexBin: codexExecutable(),
+      workspace,
+      sandbox,
+      model: bot.model || undefined,
+      reasoningEffort: bot.reasoningEffort,
+    });
+    const teamRunner = new TeamRunner({
+      workspaceRoot: join(projectDir, 'workspaces', 'team'),
+      leaderName: leader.name,
+      workerName: worker.name,
+      makeLeader: makeRunner(leader, 'read-only'),
+      makeWorker: makeRunner(worker, 'workspace-write'),
+    });
+    console.log(`协作模式已启用：${leader.name} 负责，${worker.name} 执行。`);
+    return { leaderAppId: leader.appId, chatId: team.chatId, workerName: worker.name, runner: teamRunner };
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.warn('协作模式未启用。请检查本机 team.json，并同时启动两个机器人。');
+    return null;
+  }
+}
+
 async function start() {
   const mappings = selectedMappings();
   acquireLock();
+  const team = loadTeam(mappings);
 
   const connections = [];
   let stopping = false;
@@ -160,7 +193,13 @@ async function start() {
         messenger: makeMessenger(config),
         botName: config.name,
         persona: config.persona,
+        ...(team?.leaderAppId === config.appId && {
+          teamRunner: team.runner,
+          teamChatId: team.chatId,
+          teamWorkerLabel: team.workerName,
+        }),
         logger: {
+          info: (message) => console.log(logPrefix + message),
           warn: (message) => console.warn(logPrefix + message),
           error: (message) => console.error(logPrefix + message),
         },

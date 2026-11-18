@@ -320,3 +320,161 @@ test('configured persona is included on each turn while preserving the exact loc
   assert.equal(calls[1].sessionId, 'opaque-chat-1');
   assert.ok(replies.some(reply => reply.text.includes('DevBot')));
 });
+
+const teamGroup = { chat: 'oc_team_group', chatType: 'group', mentions: [{ key: '@_user_1' }] };
+function teamEvent(task, overrides = {}) {
+  return event(`@_user_1 /协作 ${task}`, { ...teamGroup, ...overrides });
+}
+
+test('team jobs require the paired owner and configured mentioned group, and preserve ordinary sessions', async t => {
+  const tasks = [];
+  const info = [];
+  const { bot, calls, replies, stateFile } = fixture(t, {
+    botName: 'Leader',
+    logger: { info(message) { info.push(message); } },
+    teamChatId: teamGroup.chat,
+    teamWorkerLabel: 'Worker',
+    teamRunner: {
+      async run({ prompt, onStage }) {
+        tasks.push(prompt);
+        await onStage('plan');
+        await onStage('execute');
+        await onStage('review');
+        return { text: '团队结果' };
+      },
+      cancel() { return false; },
+    },
+  });
+  bot.handleEvent(teamEvent('未配对'));
+  await bot.idle();
+  await bind(bot);
+  bot.handleEvent(event('@_user_1 普通问题', teamGroup));
+  bot.handleEvent(teamEvent('其他用户', { sender: 'ou_other' }));
+  bot.handleEvent(teamEvent('机器人发来的消息', { senderType: 'app' }));
+  bot.handleEvent(teamEvent('其他群', { chat: 'oc_other_group' }));
+  bot.handleEvent(teamEvent('未 @', { mentions: [] }));
+  bot.handleEvent(event('/协作 私聊任务'));
+  bot.handleEvent(teamEvent(''));
+  const accepted = teamEvent('写使用说明\n写清楚步骤');
+  assert.equal(bot.handleEvent(accepted), undefined);
+  assert.deepEqual(tasks, []);
+  bot.handleEvent(accepted);
+  bot.handleEvent(event('@_user_1 普通续问', teamGroup));
+  await bot.idle();
+
+  assert.deepEqual(tasks, ['写使用说明\n写清楚步骤']);
+  assert.deepEqual(calls.map(call => [call.prompt, call.sessionId]), [
+    ['普通问题', undefined],
+    ['普通续问', 'opaque-chat-1'],
+  ]);
+  assert.deepEqual(Object.values(JSON.parse(readFileSync(stateFile)).sessions), ['opaque-chat-1']);
+  assert.ok(replies.some(reply => reply.text.includes('请在 /协作 后写任务')));
+  const acceptedReplies = replies.filter(reply => reply.messageId === accepted.message.message_id);
+  assert.deepEqual(acceptedReplies.map(reply => reply.text), [
+    '已收到协作任务。Leader 正在规划，随后由 Worker 执行。',
+    '规划已完成，Worker 正在执行。',
+    '执行已完成，Leader 正在审查结果。',
+    '协作汇报\n团队结果',
+  ]);
+  assert.deepEqual(info, ['协作开始：规划/执行/审查。', '协作完成，结果已回复飞书。']);
+});
+
+test('a bot without team routing never interprets /协作 as a regular Codex prompt', async t => {
+  const { bot, replies, calls } = fixture(t);
+  await bind(bot);
+  bot.handleEvent(teamEvent('不能走普通执行'));
+  await bot.idle();
+  assert.equal(calls.length, 0);
+  assert.match(replies.at(-1).text, /@ 负责人/);
+});
+
+test('/stop cancels the team runner, discards the rest of this chat, and suppresses late replies', async t => {
+  const started = deferred();
+  const teamResult = deferred();
+  const tasks = [];
+  let teamCancelled = 0;
+  const { bot, calls, replies } = fixture(t, {
+    teamChatId: teamGroup.chat,
+    teamRunner: {
+      async run({ prompt, onStage }) {
+        tasks.push(prompt);
+        started.resolve();
+        const result = await teamResult.promise;
+        await onStage('review');
+        return result;
+      },
+      cancel() {
+        teamCancelled++;
+        teamResult.resolve({ text: '晚到结果' });
+        return true;
+      },
+    },
+  });
+  await bind(bot);
+  bot.handleEvent(teamEvent('正在执行'));
+  await started.promise;
+  bot.handleEvent(teamEvent('排队任务'));
+  bot.handleEvent(event('保留私聊'));
+  bot.handleEvent(event('@_user_1 /stop', teamGroup));
+  await bot.idle();
+
+  assert.equal(teamCancelled, 1);
+  assert.deepEqual(tasks, ['正在执行']);
+  assert.deepEqual(calls.map(call => call.prompt), ['保留私聊']);
+  assert.ok(!replies.some(reply => /晚到结果|审查结果/.test(reply.text)));
+  assert.ok(replies.some(reply => /取消 1 条等待任务/.test(reply.text)));
+});
+
+for (const trigger of ['close', 'state failure']) {
+  test(`${trigger} cancels active team work and prevents late replies`, async t => {
+    const started = deferred();
+    const teamResult = deferred();
+    let teamCancelled = 0;
+    const { bot, replies, stateFile } = fixture(t, {
+      teamChatId: teamGroup.chat,
+      teamRunner: {
+        async run() {
+          started.resolve();
+          return teamResult.promise;
+        },
+        cancel() {
+          teamCancelled++;
+          teamResult.resolve({ text: '晚到结果' });
+          return true;
+        },
+      },
+    });
+    await bind(bot);
+    bot.handleEvent(teamEvent('正在执行'));
+    await started.promise;
+    if (trigger === 'close') {
+      await bot.close();
+    } else {
+      rmSync(stateFile);
+      mkdirSync(stateFile);
+      bot.handleEvent(teamEvent('不能写入去重文件'));
+      await bot.idle();
+      assert.ok(replies.some(reply => /状态保存失败/.test(reply.text)));
+    }
+    assert.equal(teamCancelled, 1);
+    assert.ok(!replies.some(reply => /晚到结果/.test(reply.text)));
+  });
+}
+
+test('team failure reports a safe stage and does not forward raw errors', async t => {
+  const { bot, replies, logs } = fixture(t, {
+    teamChatId: teamGroup.chat,
+    teamRunner: {
+      async run() {
+        throw Object.assign(new Error('SECRET raw failure'), { code: 'TEAM_EXECUTE_FAILED' });
+      },
+      cancel() { return false; },
+    },
+  });
+  await bind(bot);
+  bot.handleEvent(teamEvent('任务失败'));
+  await bot.idle();
+  assert.match(replies.at(-1).text, /协作未完成：执行者未完成任务/);
+  assert.ok(!replies.some(reply => reply.text.includes('SECRET')));
+  assert.ok(!logs.some(message => message.includes('SECRET')));
+});
