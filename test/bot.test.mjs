@@ -326,7 +326,7 @@ function teamEvent(task, overrides = {}) {
   return event(`@_user_1 /协作 ${task}`, { ...teamGroup, ...overrides });
 }
 
-test('team jobs require the paired owner and configured mentioned group, and preserve ordinary sessions', async t => {
+test('ordinary mentions default to teamwork only for the paired owner in the configured group', async t => {
   const tasks = [];
   const info = [];
   const { bot, calls, replies, stateFile } = fixture(t, {
@@ -345,29 +345,34 @@ test('team jobs require the paired owner and configured mentioned group, and pre
       cancel() { return false; },
     },
   });
-  bot.handleEvent(teamEvent('未配对'));
+  bot.handleEvent(event('@_user_1 未配对', teamGroup));
   await bot.idle();
   await bind(bot);
-  bot.handleEvent(event('@_user_1 普通问题', teamGroup));
+  bot.handleEvent(event('私聊问题'));
+  bot.handleEvent(event('@_user_1 其他群的问题', { ...teamGroup, chat: 'oc_other_group' }));
+  bot.handleEvent(event('@_user_1 其他用户的问题', { ...teamGroup, sender: 'ou_other' }));
+  bot.handleEvent(event('没有提及的群消息', { ...teamGroup, mentions: [] }));
   bot.handleEvent(teamEvent('其他用户', { sender: 'ou_other' }));
   bot.handleEvent(teamEvent('机器人发来的消息', { senderType: 'app' }));
   bot.handleEvent(teamEvent('其他群', { chat: 'oc_other_group' }));
   bot.handleEvent(teamEvent('未 @', { mentions: [] }));
   bot.handleEvent(event('/协作 私聊任务'));
   bot.handleEvent(teamEvent(''));
-  const accepted = teamEvent('写使用说明\n写清楚步骤');
+  const accepted = event('@_user_1 写使用说明\n写清楚步骤', teamGroup);
   assert.equal(bot.handleEvent(accepted), undefined);
   assert.deepEqual(tasks, []);
   bot.handleEvent(accepted);
-  bot.handleEvent(event('@_user_1 普通续问', teamGroup));
+  bot.handleEvent(teamEvent('显式协作任务'));
+  bot.handleEvent(event('私聊续问'));
   await bot.idle();
 
-  assert.deepEqual(tasks, ['写使用说明\n写清楚步骤']);
+  assert.deepEqual(tasks, ['写使用说明\n写清楚步骤', '显式协作任务']);
   assert.deepEqual(calls.map(call => [call.prompt, call.sessionId]), [
-    ['普通问题', undefined],
-    ['普通续问', 'opaque-chat-1'],
+    ['私聊问题', undefined],
+    ['其他群的问题', undefined],
+    ['私聊续问', 'opaque-chat-1'],
   ]);
-  assert.deepEqual(Object.values(JSON.parse(readFileSync(stateFile)).sessions), ['opaque-chat-1']);
+  assert.deepEqual(Object.values(JSON.parse(readFileSync(stateFile)).sessions), ['opaque-chat-1', 'opaque-chat-2']);
   assert.ok(replies.some(reply => reply.text.includes('请在 /协作 后写任务')));
   const acceptedReplies = replies.filter(reply => reply.messageId === accepted.message.message_id);
   assert.deepEqual(acceptedReplies.map(reply => reply.text), [
@@ -376,7 +381,34 @@ test('team jobs require the paired owner and configured mentioned group, and pre
     '执行已完成，Leader 正在审查结果。',
     '协作汇报\n团队结果',
   ]);
-  assert.deepEqual(info, ['协作开始：规划/执行/审查。', '协作完成，结果已回复飞书。']);
+  const completed = ['协作开始：规划/执行/审查。', '协作完成，结果已回复飞书。'];
+  assert.deepEqual(info, [...completed, ...completed]);
+});
+
+test('the leader keeps control commands out of the default team workflow', async t => {
+  const tasks = [];
+  const { bot, calls, replies } = fixture(t, {
+    teamChatId: teamGroup.chat,
+    teamRunner: {
+      async run({ prompt }) { tasks.push(prompt); return { text: '团队结果' }; },
+      cancel() { return false; },
+    },
+  });
+  await bind(bot);
+
+  for (const [command, expected] of [
+    ['/help', /查看帮助/],
+    ['/status', /当前会话/],
+    ['/stop', /没有正在执行或等待的任务/],
+    ['/new', /已开始新对话/],
+  ]) {
+    const message = event(`@_user_1 ${command}`, teamGroup);
+    bot.handleEvent(message);
+    await bot.idle();
+    assert.match(replies.find(reply => reply.messageId === message.message.message_id).text, expected);
+  }
+  assert.deepEqual(tasks, []);
+  assert.deepEqual(calls, []);
 });
 
 test('a bot without team routing never interprets /协作 as a regular Codex prompt', async t => {

@@ -56,7 +56,7 @@ export class Bot {
     this.teamChatId = teamChatId;
     this.teamWorkerLabel = (typeof teamWorkerLabel === 'string' ? teamWorkerLabel.trim() : '') || '执行机器人';
     const stopHelp = '/stop — 停止当前会话的本机 Codex 进程，并清空其等待队列。';
-    const teamHelp = teamRunner ? '\n/协作 任务描述 — 在指定群 @ 我，开启规划、执行和审查。' : '';
+    const teamHelp = teamRunner ? '\n在指定群 @ 我并直接发任务，即会启动协作。' : '';
     this.helpText = `你正在与 ${this.workerLabel} 对话，任务由本机 Codex 处理。${HELP}\n${stopHelp}${teamHelp}`;
     this.logger = logger;
     this.maxQueue = maxQueue;
@@ -198,6 +198,7 @@ export class Bot {
     }
 
     const key = JSON.stringify([message.chat_id, senderId]);
+    const inTeamGroup = Boolean(this.teamRunner && message.chat_type === 'group' && message.chat_id === this.teamChatId);
     const teamCommand = TEAM_COMMAND.exec(text);
     const teamTask = teamCommand?.[1]?.trim();
     if (/^\/pair(?:\s|$)/i.test(text)) {
@@ -218,8 +219,8 @@ export class Bot {
       void this.reply(messageId, active || removed ? stopped : '当前会话没有正在执行或等待的任务。');
       this.notifyIdle();
     } else if (teamCommand && !this.teamRunner) {
-      void this.reply(messageId, '请在指定群 @ 负责人，并发送 /协作 任务描述。');
-    } else if (teamCommand && (message.chat_type !== 'group' || message.chat_id !== this.teamChatId)) {
+      void this.reply(messageId, '请在指定群 @ 负责人并直接发任务。');
+    } else if (teamCommand && !inTeamGroup) {
       void this.reply(messageId, '协作仅在配置的群聊中可用，请在该群 @ 我。');
     } else if (teamCommand && !teamTask) {
       void this.reply(messageId, `请在 /协作 后写任务，例如：@${this.workerLabel} /协作 写一份机器人使用说明。`);
@@ -230,8 +231,9 @@ export class Bot {
     } else if (this.queue.length + (this.current ? 1 : 0) >= this.maxQueue) {
       void this.reply(messageId, '等待队列已满，请稍后再发送任务。');
     } else {
+      const reset = text === '/new';
       this.queue.push({
-        messageId, key, text: teamTask ?? text, team: Boolean(teamCommand), reset: text === '/new', cancelled: false,
+        messageId, key, text: teamTask ?? text, team: inTeamGroup && !reset, reset, cancelled: false,
       });
       this.scheduleDrain();
     }
