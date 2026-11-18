@@ -1,0 +1,20 @@
+{
+  "name": "feishu-local-codex",
+  "version": "1.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "setup": "node src/main.mjs setup",
+    "list": "node src/main.mjs list",
+    "start": "node src/main.mjs start",
+    "check": "node src/main.mjs check",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.76.0"
+  }
+}
