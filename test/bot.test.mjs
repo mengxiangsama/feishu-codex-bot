@@ -207,6 +207,46 @@ test('/stop cancels the local worker and clears only this chat queue', async t =
   assert.ok(!replies.some(reply => /执行失败/.test(reply.text)));
 });
 
+test('a collaboration reservation blocks direct execution and leaves unrelated stop commands responsive', async t => {
+  const { bot, runner, calls, replies } = fixture(t, { botName: 'Worker' });
+  await bind(bot);
+  let cancelled = 0;
+  runner.cancel = () => { cancelled++; };
+  const release = bot.reserveForTeam();
+  assert.equal(typeof release, 'function');
+  try {
+    assert.equal(bot.reserveForTeam(), undefined);
+    const abort = new AbortController();
+    const waiting = bot.idle(abort.signal);
+    assert.equal(bot.idleWaiters.size, 1);
+    abort.abort();
+    await waiting;
+    assert.equal(bot.idleWaiters.size, 0);
+
+    bot.handleEvent(event('cancel queued'));
+    bot.handleEvent(event('keep queued', { chat: 'oc_other' }));
+    bot.handleEvent(event('/status'));
+    bot.handleEvent(event('/stop'));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(calls, []);
+    assert.equal(cancelled, 0);
+    assert.ok(replies.some(reply => /正在执行协作任务/.test(reply.text)));
+    assert.equal(replies.at(-1).text, '已取消 1 条等待任务。');
+  } finally {
+    release();
+    release();
+  }
+  const queuedReservation = bot.reserveForTeam();
+  queuedReservation?.();
+  assert.equal(queuedReservation, undefined);
+  await bot.idle();
+  assert.deepEqual(calls.map(call => call.prompt), ['keep queued']);
+  await bot.close();
+  assert.equal(bot.canAcceptTeamWork, false);
+  assert.equal(bot.reserveForTeam(), undefined);
+});
+
 test('queue is bounded, text-only inputs are enforced, and failed replies do not block execution', async t => {
   const started = deferred();
   const active = deferred();
@@ -333,12 +373,12 @@ test('ordinary mentions default to teamwork only for the paired owner in the con
     botName: 'Leader',
     logger: { info(message) { info.push(message); } },
     teamChatId: teamGroup.chat,
-    teamWorkerLabel: 'Worker',
     teamRunner: {
       async run({ prompt, onStage }) {
         tasks.push(prompt);
         await onStage('plan');
-        await onStage('execute');
+        if (tasks.length === 1) await onStage('waiting');
+        await onStage('execute', tasks.length === 1 ? 'Worker 2' : 'Worker 1');
         await onStage('review');
         return { text: '团队结果' };
       },
@@ -376,8 +416,9 @@ test('ordinary mentions default to teamwork only for the paired owner in the con
   assert.ok(replies.some(reply => reply.text.includes('请在 /协作 后写任务')));
   const acceptedReplies = replies.filter(reply => reply.messageId === accepted.message.message_id);
   assert.deepEqual(acceptedReplies.map(reply => reply.text), [
-    '已收到协作任务。Leader 正在规划，随后由 Worker 执行。',
-    '规划已完成，Worker 正在执行。',
+    '已收到协作任务。Leader 正在规划，随后会安排执行。',
+    '规划已完成，执行机器人都在忙，正在等待空闲。',
+    '规划已完成，Worker 2 正在执行。',
     '执行已完成，Leader 正在审查结果。',
     '协作汇报\n团队结果',
   ]);

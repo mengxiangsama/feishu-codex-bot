@@ -8,6 +8,7 @@ const HELP = '直接发送文字任务即可连续对话。\n/new — 开始新�
 const TEAM_COMMAND = /^\/协作(?:\s+([\s\S]*))?$/;
 const TEAM_FAILURES = new Map([
   ['TEAM_PLAN_FAILED', '负责人规划未完成'],
+  ['TEAM_WORKER_UNAVAILABLE', '没有可用的执行机器人'],
   ['TEAM_EXECUTE_FAILED', '执行者未完成任务'],
   ['TEAM_REVIEW_FAILED', '负责人审查未完成'],
 ]);
@@ -36,8 +37,10 @@ function validateState(value) {
 
 /** Routes Feishu events to one local Codex worker. No message text is persisted. */
 export class Bot {
+  #teamReservation;
+
   constructor({ stateFile, runner, messenger, botName, persona, teamRunner, teamChatId,
-    teamWorkerLabel, logger = console, maxQueue = 8 }) {
+    logger = console, maxQueue = 8 }) {
     if (!stateFile || !runner?.run || !runner?.cancel || !messenger?.reply ||
         !Number.isInteger(maxQueue) || maxQueue < 1) {
       throw new Error('机器人配置不完整。');
@@ -54,7 +57,6 @@ export class Bot {
     this.workerLabel = this.botName || '本机 Codex';
     this.teamRunner = teamRunner;
     this.teamChatId = teamChatId;
-    this.teamWorkerLabel = (typeof teamWorkerLabel === 'string' ? teamWorkerLabel.trim() : '') || '执行机器人';
     const stopHelp = '/stop — 停止当前会话的本机 Codex 进程，并清空其等待队列。';
     const teamHelp = teamRunner ? '\n在指定群 @ 我并直接发任务，即会启动协作。' : '';
     this.helpText = `你正在与 ${this.workerLabel} 对话，任务由本机 Codex 处理。${HELP}\n${stopHelp}${teamHelp}`;
@@ -84,6 +86,23 @@ export class Bot {
 
   get pairingCode() { return this.state.ownerOpenId ? undefined : this.state.pairingCode; }
   get ownerOpenId() { return this.state.ownerOpenId; }
+  get canAcceptTeamWork() { return !this.closed && !this.failed; }
+
+  get #isIdle() {
+    return !this.draining && !this.scheduled && !this.queue.length && !this.pendingReplies.size && !this.#teamReservation;
+  }
+
+  reserveForTeam() {
+    if (!this.canAcceptTeamWork || !this.#isIdle) return undefined;
+    const release = () => {
+      if (this.#teamReservation !== release) return;
+      this.#teamReservation = undefined;
+      if (this.queue.length) this.scheduleDrain();
+      this.notifyIdle();
+    };
+    this.#teamReservation = release;
+    return release;
+  }
 
   persist() {
     const temporary = `${this.stateFile}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
@@ -206,7 +225,7 @@ export class Bot {
     } else if (text === '/help') {
       void this.reply(messageId, this.helpText);
     } else if (text === '/status') {
-      const current = this.current ? '正在处理任务' : '空闲';
+      const current = this.#teamReservation ? '正在执行协作任务' : this.current ? '正在处理任务' : '空闲';
       const context = this.state.sessions[key] ? '已有连续对话' : '新对话';
       void this.reply(messageId, `机器人：${this.workerLabel}\n状态：${current}\n等待任务：${this.queue.length}\n当前会话：${context}`);
     } else if (text === '/stop') {
@@ -215,8 +234,9 @@ export class Bot {
       const removed = before - this.queue.length;
       const active = this.current?.key === key;
       if (active) this.cancelCurrentJob();
-      const stopped = `已停止当前会话的本机 Codex 进程，并取消 ${removed} 条等待任务。`;
-      void this.reply(messageId, active || removed ? stopped : '当前会话没有正在执行或等待的任务。');
+      const cancelled = `已取消 ${removed} 条等待任务。`;
+      if (active) void this.reply(messageId, '已停止当前会话的本机 Codex 进程。' + cancelled);
+      else void this.reply(messageId, removed ? cancelled : '当前会话没有正在执行或等待的任务。');
       this.notifyIdle();
     } else if (teamCommand && !this.teamRunner) {
       void this.reply(messageId, '请在指定群 @ 负责人并直接发任务。');
@@ -240,7 +260,7 @@ export class Bot {
   }
 
   scheduleDrain() {
-    if (this.scheduled || this.draining || this.closed || this.failed) return;
+    if (this.scheduled || this.draining || this.closed || this.failed || this.#teamReservation) return;
     this.scheduled = true;
     queueMicrotask(() => {
       this.scheduled = false;
@@ -274,7 +294,7 @@ export class Bot {
       return;
     }
     await this.reply(job.messageId, job.team
-      ? `已收到协作任务。${this.workerLabel} 正在规划，随后由 ${this.teamWorkerLabel} 执行。`
+      ? `已收到协作任务。${this.workerLabel} 正在规划，随后会安排执行。`
       : `已收到，正在由${this.workerLabel}处理。`);
     if (job.cancelled || this.closed || this.failed) return;
     // Confirm persistence is still writable immediately before submitting a task.
@@ -316,17 +336,20 @@ export class Bot {
   }
 
   async processTeamJob(job) {
-    const stages = {
-      execute: `规划已完成，${this.teamWorkerLabel} 正在执行。`,
-      review: `执行已完成，${this.workerLabel} 正在审查结果。`,
-    };
+    const stageMessages = new Map([
+      ['waiting', '规划已完成，执行机器人都在忙，正在等待空闲。'],
+      ['review', `执行已完成，${this.workerLabel} 正在审查结果。`],
+    ]);
     this.log('协作开始：规划/执行/审查。', 'info');
     try {
       const result = await this.teamRunner.run({
         prompt: job.text,
-        onStage: async stage => {
-          if (job.cancelled || this.closed || this.failed || !Object.hasOwn(stages, stage)) return;
-          await this.reply(job.messageId, stages[stage]);
+        onStage: async (stage, workerName) => {
+          if (job.cancelled || this.closed || this.failed) return;
+          const message = stage === 'execute'
+            ? `规划已完成，${workerName || '执行机器人'} 正在执行。`
+            : stageMessages.get(stage);
+          if (message) await this.reply(job.messageId, message);
         },
       });
       if (job.cancelled || this.closed || this.failed) return;
@@ -352,14 +375,21 @@ export class Bot {
   }
 
   notifyIdle() {
-    if (this.draining || this.scheduled || this.queue.length || this.pendingReplies.size) return;
+    if (!this.#isIdle) return;
     for (const resolveIdle of this.idleWaiters) resolveIdle();
-    this.idleWaiters.clear();
   }
 
-  async idle() {
-    if (!this.draining && !this.scheduled && !this.queue.length && !this.pendingReplies.size) return;
-    await new Promise(resolveIdle => this.idleWaiters.add(resolveIdle));
+  async idle(signal) {
+    if (signal?.aborted || this.#isIdle) return;
+    await new Promise(resolveIdle => {
+      const finish = () => {
+        this.idleWaiters.delete(finish);
+        signal?.removeEventListener('abort', finish);
+        resolveIdle();
+      };
+      this.idleWaiters.add(finish);
+      signal?.addEventListener('abort', finish, { once: true });
+    });
   }
 
   async close() {

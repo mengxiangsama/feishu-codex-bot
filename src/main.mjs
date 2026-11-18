@@ -9,7 +9,7 @@ import { Bot } from './bot.mjs';
 import { codexExecutable, ensureLocalDir, loadMappings, localDir, projectDir, saveMappings, validateMapping } from './config.mjs';
 import { connectFeishu, makeMessenger } from './feishu.mjs';
 import { CodexRunner, REASONING_EFFORTS } from './codex-runner.mjs';
-import { TeamRunner } from './team-runner.mjs';
+import { reserveTeamWorker, TeamRunner } from './team-runner.mjs';
 
 const [, , command = 'help', selector] = process.argv;
 
@@ -127,16 +127,19 @@ function acquireLock() {
   process.once('exit', () => rmSync(path, { force: true }));
 }
 
-function loadTeam(mappings) {
+function loadTeam(mappings, bots) {
   try {
     const team = JSON.parse(readFileSync(join(localDir, 'team.json'), 'utf8'));
     const leader = mappings.find(({ appId }) => appId === team.leaderAppId);
-    const worker = mappings.find(({ appId }) => appId === team.workerAppId);
+    const workerIds = team.workerAppIds ?? [team.workerAppId];
     if (team.version !== 1 || typeof team.chatId !== 'string' || !/^oc_[A-Za-z0-9]+$/.test(team.chatId) ||
-        !leader || !worker || leader.appId === worker.appId) {
+        !leader || !Array.isArray(workerIds) || !workerIds.length ||
+        new Set(workerIds).size !== workerIds.length || workerIds.includes(leader.appId)) {
       throw new Error('invalid team');
     }
-    const makeRunner = (bot, sandbox) => ({ workspace }) => new CodexRunner({
+    const workers = workerIds.map((id) => mappings.find(({ appId }) => appId === id));
+    if (workers.some((worker) => !worker)) throw new Error('invalid team worker');
+    const makeRunner = (bot, sandbox, workspace) => new CodexRunner({
       codexBin: codexExecutable(),
       workspace,
       sandbox,
@@ -146,14 +149,24 @@ function loadTeam(mappings) {
     const teamRunner = new TeamRunner({
       workspaceRoot: join(projectDir, 'workspaces', 'team'),
       leaderName: leader.name,
-      workerName: worker.name,
-      makeLeader: makeRunner(leader, 'read-only'),
-      makeWorker: makeRunner(worker, 'workspace-write'),
+      makeLeader: ({ workspace }) => makeRunner(leader, 'read-only', workspace),
+      acquireWorker: async ({ workspace, signal, onWait }) => {
+        const { worker, release } = await reserveTeamWorker(
+          () => workers.map((worker) => ({ worker, bot: bots.get(worker.appId) })), signal, onWait,
+        );
+        try {
+          signal.throwIfAborted();
+          return { name: worker.name, runner: makeRunner(worker, 'workspace-write', workspace), release };
+        } catch (error) {
+          release();
+          throw error;
+        }
+      },
     });
-    console.log(`协作模式已启用：${leader.name} 负责，${worker.name} 执行。`);
-    return { leaderAppId: leader.appId, chatId: team.chatId, workerName: worker.name, runner: teamRunner };
+    console.log(`协作模式已启用：${leader.name} 负责，执行者：${workers.map(({ name }) => name).join('、')}。`);
+    return { leaderAppId: leader.appId, chatId: team.chatId, runner: teamRunner };
   } catch (error) {
-    if (error.code !== 'ENOENT') console.warn('协作模式未启用。请检查本机 team.json，并同时启动两个机器人。');
+    if (error.code !== 'ENOENT') console.warn('协作模式未启用。请检查本机 team.json，并启动配置的负责人和执行者。');
     return null;
   }
 }
@@ -161,7 +174,8 @@ function loadTeam(mappings) {
 async function start() {
   const mappings = selectedMappings();
   acquireLock();
-  const team = loadTeam(mappings);
+  const bots = new Map();
+  const team = loadTeam(mappings, bots);
 
   const connections = [];
   let stopping = false;
@@ -196,7 +210,6 @@ async function start() {
         ...(team?.leaderAppId === config.appId && {
           teamRunner: team.runner,
           teamChatId: team.chatId,
-          teamWorkerLabel: team.workerName,
         }),
         logger: {
           info: (message) => console.log(logPrefix + message),
@@ -204,13 +217,22 @@ async function start() {
           error: (message) => console.error(logPrefix + message),
         },
       });
-      const connection = { bot, code: bot.pairingCode, label: logPrefix };
-      connections.push(connection);
-      connection.ws = await connectFeishu(config, (event) => bot.handleEvent(event));
-      if (stopping) connection.ws.close({ force: true });
-      else console.log(logPrefix + '正在连接飞书…');
+      bots.set(config.appId, bot);
+      connections.push({ config, bot, code: bot.pairingCode, label: logPrefix });
     } catch (error) {
       console.error(logPrefix + '启动失败。' + error.message);
+    }
+  }
+
+  for (const connection of connections) {
+    if (stopping) break;
+    const { config, bot, label } = connection;
+    try {
+      connection.ws = await connectFeishu(config, (event) => bot.handleEvent(event));
+      if (stopping) connection.ws.close({ force: true });
+      else console.log(label + '正在连接飞书…');
+    } catch (error) {
+      console.error(label + '启动失败。' + error.message);
     }
   }
 
