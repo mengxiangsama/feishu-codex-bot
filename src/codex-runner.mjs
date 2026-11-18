@@ -7,17 +7,22 @@ const MAX_LINE_BYTES = 8 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const fail = (code, message) => Object.assign(new Error(message), { code });
 
+export const REASONING_EFFORTS = Object.freeze(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+
 /** One local Codex task per instance. Authentication stays in the existing CLI. */
 export class CodexRunner {
   #active = null;
 
-  constructor({ codexBin = 'codex', workspace, sandbox = 'workspace-write', model,
+  constructor({ codexBin = 'codex', workspace, sandbox = 'workspace-write', model, reasoningEffort,
     timeoutMs = 900_000, env = process.env } = {}) {
     if (!workspace || !['read-only', 'workspace-write'].includes(sandbox)
       || typeof codexBin !== 'string' || !codexBin
       || (model != null && (typeof model !== 'string' || !model))
       || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       throw fail('CODEX_CONFIGURATION', 'Codex 工作目录、模型、权限或超时配置无效。');
+    }
+    if (reasoningEffort != null && reasoningEffort !== '' && !REASONING_EFFORTS.includes(reasoningEffort)) {
+      throw fail('CODEX_CONFIGURATION', 'Codex 推理强度配置无效。');
     }
     this.workspace = resolve(workspace);
     try {
@@ -28,6 +33,7 @@ export class CodexRunner {
     this.codexBin = codexBin;
     this.sandbox = sandbox;
     this.model = model;
+    this.reasoningEffort = reasoningEffort;
     this.timeoutMs = timeoutMs;
     this.env = env;
   }
@@ -44,6 +50,7 @@ export class CodexRunner {
       '--color', 'never', '--cd', this.workspace, '--sandbox', this.sandbox,
       '-c', 'approval_policy="never"', '-c', `sandbox_mode="${this.sandbox}"`];
     if (this.model) args.push('--model', this.model);
+    if (this.reasoningEffort) args.push('-c', `model_reasoning_effort="${this.reasoningEffort}"`);
     if (sessionId) args.push('resume', '--json', '--skip-git-repo-check', '--ignore-user-config', sessionId, '-');
     else args.push('-');
 

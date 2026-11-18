@@ -8,7 +8,7 @@ import { Writable } from 'node:stream';
 import { Bot } from './bot.mjs';
 import { codexExecutable, ensureLocalDir, loadMappings, localDir, projectDir, saveMappings, validateMapping } from './config.mjs';
 import { connectFeishu, makeMessenger } from './feishu.mjs';
-import { CodexRunner } from './codex-runner.mjs';
+import { CodexRunner, REASONING_EFFORTS } from './codex-runner.mjs';
 
 const [, , command = 'help', selector] = process.argv;
 
@@ -41,6 +41,17 @@ async function setup() {
     }
   }
 
+  async function askCodexSetting(label, currentValue, updating) {
+    const hint = updating
+      ? '，直接回车保留当前设置（' + (currentValue || 'Codex 默认值') + '），输入 - 使用 Codex 默认值'
+      : '，输入 - 使用 Codex 默认值';
+    let input;
+    do {
+      input = await ask(label + hint);
+    } while (!input && !updating);
+    return input === '-' ? '' : input || currentValue || '';
+  }
+
   try {
     console.log('创建或更新机器人。每个机器人使用一个飞书自建应用。');
     const appId = await ask('飞书 App ID');
@@ -50,8 +61,10 @@ async function setup() {
     const name = await ask('机器人名称 [' + (current?.name || '本机 Codex') + ']') || current?.name || '本机 Codex';
     const personaInput = await ask('角色说明，例如「Java 项目助手，优先用中文回复」' + (current ? '，留空保留，填 - 清空' : '，可留空'));
     const persona = personaInput === '-' ? '' : personaInput || current?.persona || '';
-    const modelInput = await ask('Codex 模型 ID，留空使用' + (current?.model || '默认模型') + '，填 - 恢复默认');
-    const model = modelInput === '-' ? '' : modelInput || current?.model || '';
+    const model = await askCodexSetting('Codex 模型 ID', current?.model, Boolean(current));
+    const reasoningEffort = await askCodexSetting(
+      'Codex 推理强度 [' + REASONING_EFFORTS.join('/') + ']', current?.reasoningEffort, Boolean(current),
+    );
     const defaultWorkspace = current?.workspace || join(projectDir, 'workspaces', appId);
     const workspaceInput = await ask('工作目录，留空使用 ' + defaultWorkspace);
     const workspace = workspaceInput ? resolve(workspaceInput.replace(/^~(?=\/|$)/, homedir())) : defaultWorkspace;
@@ -60,7 +73,7 @@ async function setup() {
     const sandbox = access === '2' ? 'workspace-write' : access === '1' ? 'read-only' : current?.sandbox || 'read-only';
     if (!workspaceInput && !current) mkdirSync(workspace, { recursive: true, mode: 0o700 });
     ensureLocalDir();
-    const mapping = validateMapping({ name, appId, appSecret, persona, model, sandbox, workspace });
+    const mapping = validateMapping({ name, appId, appSecret, persona, model, reasoningEffort, sandbox, workspace });
     const others = mappings.filter((entry) => entry.appId !== appId);
     if (others.some((entry) => entry.name === name)) throw new Error('该名称已用于另一条连接。请用其他名称。');
     saveMappings([...others, mapping]);
@@ -142,6 +155,7 @@ async function start() {
           workspace: config.workspace,
           sandbox: config.sandbox,
           model: config.model || undefined,
+          reasoningEffort: config.reasoningEffort,
         }),
         messenger: makeMessenger(config),
         botName: config.name,
@@ -197,8 +211,9 @@ try {
   else if (command === 'list') {
     const mappings = loadMappings();
     if (!mappings.length) console.log('暂未配置。运行 npm run setup 添加连接。');
-    else mappings.forEach(({ name, appId, workspace, model, sandbox }) => {
-      console.log(name + '  ' + appId + '  ' + (model || '默认模型') + '  ' + sandbox + '\n  ' + workspace);
+    else mappings.forEach(({ name, appId, workspace, model, reasoningEffort, sandbox }) => {
+      console.log(name + '  ' + appId + '  ' + (model || '默认模型') + '  ' +
+        (reasoningEffort || '默认推理强度') + '  ' + sandbox + '\n  ' + workspace);
     });
   } else {
     console.log('飞书 Codex 机器人\n\nnpm run setup    新建或更新机器人\nnpm run list     查看机器人\nnpm run check    检查凭证\nnpm start        启动机器人');

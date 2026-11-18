@@ -51,12 +51,20 @@ test('new task uses stdin, exact workspace and isolated config without forwardin
   assert.equal(call.args[call.args.indexOf('--cd') + 1], dir);
   assert.equal(call.args[call.args.indexOf('--sandbox') + 1], 'workspace-write');
   assert.ok(call.args.includes('approval_policy="never"'));
+  assert.ok(!call.args.some((arg) => arg.startsWith('model_reasoning_effort=')));
   assert.ok(!call.args.some((arg) => arg.includes('bypass')));
   assert.equal(runner.cancel(), false);
 });
 
-test('resume uses only its explicit session, preserving permission, model and cwd overrides', async (t) => {
-  const { runner, capture, dir } = await setup(t, 'success', { sandbox: 'read-only', model: 'test-model' });
+test('new and resumed tasks keep the model and reasoning effort, with explicit session on resume', async (t) => {
+  const { runner, capture, dir } = await setup(t, 'success', {
+    sandbox: 'read-only', model: 'test-model', reasoningEffort: 'ultra',
+  });
+  const newTask = await runner.run({ prompt: '开始' });
+  const first = JSON.parse(await readFile(capture, 'utf8')).args;
+  assert.equal(first[first.indexOf('--model') + 1], 'test-model');
+  assert.ok(first.includes('model_reasoning_effort="ultra"'));
+  assert.equal(newTask.sessionId, ID);
   assert.equal((await runner.run({ prompt: '继续', sessionId: ID })).sessionId, ID);
   const { args } = JSON.parse(await readFile(capture, 'utf8'));
   assert.deepEqual(args.slice(args.indexOf('resume')), ['resume', '--json', '--skip-git-repo-check', '--ignore-user-config', ID, '-']);
@@ -64,6 +72,7 @@ test('resume uses only its explicit session, preserving permission, model and cw
   assert.equal(args[args.indexOf('--cd') + 1], dir);
   assert.equal(args[args.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(args[args.indexOf('--model') + 1], 'test-model');
+  assert.ok(args.slice(0, args.indexOf('resume')).includes('model_reasoning_effort="ultra"'));
 });
 
 test('CLI failures do not expose raw event errors or stderr and retain their session', async (t) => {

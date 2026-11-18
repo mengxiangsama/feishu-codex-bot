@@ -2,6 +2,7 @@ import { accessSync, chmodSync, constants, mkdirSync, readFileSync, realpathSync
 import { randomUUID } from 'node:crypto';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { REASONING_EFFORTS } from './codex-runner.mjs';
 
 export const projectDir = fileURLToPath(new URL('../', import.meta.url));
 export const localDir = resolve(process.env.FEISHU_BRIDGE_DATA_DIR || join(projectDir, '.local'));
@@ -37,7 +38,11 @@ export function validateMapping(mapping) {
     throw new Error('角色说明最长 4000 字符。');
   }
   if (typeof mapping.model !== 'string' || !/^[a-zA-Z0-9._-]{0,100}$/.test(mapping.model)) {
-    throw new Error('模型 ID 格式有误。可留空使用 Codex 默认模型。');
+    throw new Error('模型 ID 格式有误。可输入 - 使用 Codex 默认模型。');
+  }
+  const reasoningEffort = mapping.reasoningEffort ?? '';
+  if (reasoningEffort !== '' && !REASONING_EFFORTS.includes(reasoningEffort)) {
+    throw new Error('推理强度须为 ' + REASONING_EFFORTS.join('、') + ' 之一，也可输入 - 使用 Codex 默认值。');
   }
   if (!['read-only', 'workspace-write'].includes(mapping.sandbox)) throw new Error('请选只读或允许修改工作目录。');
   if (typeof mapping.workspace !== 'string' || !mapping.workspace.length) throw new Error('请填写工作目录。');
@@ -53,7 +58,7 @@ export function validateMapping(mapping) {
   } catch {
     throw new Error('工作目录必须存在，且不能包含本工具的密钥目录或位于其内部。');
   }
-  return { ...mapping, workspace };
+  return { ...mapping, reasoningEffort, workspace };
 }
 
 export function loadMappings() {
