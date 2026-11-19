@@ -4,6 +4,8 @@
 
 工具会优先使用 ChatGPT 桌面应用附带的 Codex CLI，沿用本机 CLI 已保存的登录状态。飞书通过长连接传消息，因此这台电脑保持开机联网、工具保持运行即可，无需公网回调地址。
 
+**群内派工。** 配好协作群后，在群里 @ 负责人（例如 Astra）发送任务，开启免 @ 后也可以直接发。Astra 先规划，桥接把任务派给空闲的执行机器人。所有执行机器人都在忙时，任务会排队，等有机器人空闲再派出。执行完成后，Astra 复审结果并在群里回复。见[协作配置](#在一个群里配置负责人和多个执行机器人)。
+
 <img src="assets/remote-use-qa.png" alt="问：大佬，我只有一台电脑。回家了我不想带电脑，但是想在家用，怎么办？也不知道我这样的穷学生…… 答：有的，兄弟，有的。" width="560">
 
 ## 安装
@@ -120,6 +122,12 @@ Codex CLI 会读取本机用户配置，包括配置的 MCP 服务器。需要�
 - 若意外关机后工具提示已有启动记录，请确认提示中的进程已经结束，再删除 `.local/running.pid` 后重启。
 
 [Codex CLI 非交互模式与会话恢复](https://learn.chatgpt.com/docs/non-interactive-mode)
+
+## 相关项目
+
+- 使用**流式卡片**在飞书里实时查看 Codex 的回复。[sakepurr/feishu-codex-bridge](https://github.com/sakepurr/feishu-codex-bridge)
+- 开启「咖啡一下」后，在**手机飞书私聊**里审批本机 Codex 的请求，让任务继续。[modelzen/feishu-codex-bridge](https://github.com/modelzen/feishu-codex-bridge)
+- 在飞书里选择工作区和会话，**接续电脑上已有的 Codex 对话**。[kxn/codex-remote-feishu](https://github.com/kxn/codex-remote-feishu)
 
 ## 测试与许可证
 
