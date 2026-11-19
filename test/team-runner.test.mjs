@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp, rm, stat, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import test from 'node:test';
 import { Bot } from '../src/bot.mjs';
 import { reserveTeamWorker, TeamRunner } from '../src/team-runner.mjs';
@@ -75,7 +75,7 @@ async function fixture(t, { leaderRun, workerRun, workerCancel, workerAcquire, w
   return { root, calls, reservations, runner };
 }
 
-test('plans, executes, and reviews in the same isolated directory using the leader planning session', async t => {
+test('plans, executes, and reviews in the configured project directory using the leader planning session', async t => {
   const { root, calls, reservations, runner } = await fixture(t, {
     workerName: 'Codex Sol 2',
     async workerAcquire({ onWait }, worker) {
@@ -102,7 +102,7 @@ test('plans, executes, and reviews in the same isolated directory using the lead
     ['worker', undefined],
     ['leader', 'leader-session'],
   ]);
-  assert.equal(dirname(calls[0].workspace), root);
+  assert.equal(calls[0].workspace, root);
   assert.ok(calls.every(call => call.workspace === calls[0].workspace));
   assert.ok((await stat(calls[0].workspace)).isDirectory());
   assert.ok(calls[0].prompt.includes('Codex Astra'));
@@ -114,8 +114,29 @@ test('plans, executes, and reviews in the same isolated directory using the lead
   assert.match(calls[2].prompt, /执行者的交付报告.*Sol 输出/);
 
   await runner.run({ prompt: '新的协作任务' });
-  assert.notEqual(calls[3].workspace, calls[0].workspace);
+  assert.equal(calls[3].workspace, calls[0].workspace);
   assert.equal(calls[3].sessionId, undefined);
+});
+
+test('later collaboration receives the previous leader session and sees prior project changes', async t => {
+  let calls;
+  const f = await fixture(t, {
+    workerRun: async () => {
+      const workspace = calls.at(-1).workspace;
+      const file = join(workspace, 'change.txt');
+      if (calls.filter(call => call.role === 'worker').length === 1) {
+        await writeFile(file, 'pending change');
+      } else {
+        assert.equal(await readFile(file, 'utf8'), 'pending change');
+      }
+      return { text: '完成。' };
+    },
+  });
+  calls = f.calls;
+  await f.runner.run({ prompt: '修改项目' });
+  await f.runner.run({ prompt: '发布上次修改', sessionId: 'leader-session' });
+  assert.equal(calls[3].sessionId, 'leader-session');
+  assert.ok(calls.every(call => call.workspace === f.root));
 });
 
 test('failed execution does not start review or expose its original error', async t => {

@@ -147,8 +147,9 @@ function loadTeam(mappings, bots) {
       reasoningEffort: bot.reasoningEffort,
     });
     const teamRunner = new TeamRunner({
-      workspaceRoot: join(projectDir, 'workspaces', 'team'),
+      workspaceRoot: leader.workspace,
       leaderName: leader.name,
+      workerSandbox: leader.sandbox,
       makeLeader: ({ workspace }) => makeRunner(leader, 'read-only', workspace),
       acquireWorker: async ({ workspace, signal, onWait }) => {
         const { worker, release } = await reserveTeamWorker(
@@ -156,7 +157,7 @@ function loadTeam(mappings, bots) {
         );
         try {
           signal.throwIfAborted();
-          return { name: worker.name, runner: makeRunner(worker, 'workspace-write', workspace), release };
+          return { name: worker.name, runner: makeRunner(worker, leader.sandbox, workspace), release };
         } catch (error) {
           release();
           throw error;

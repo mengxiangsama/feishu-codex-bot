@@ -36,7 +36,7 @@ async function setup(t, scenario = 'success', extra = {}) {
     timeoutMs: 3_000, env: { ...process.env, RUNNER_CAPTURE: capture, RUNNER_SCENARIO: scenario }, ...extra }) };
 }
 
-test('new task uses stdin, exact workspace and isolated config without forwarding tool output', async (t) => {
+test('new task uses stdin, exact workspace and user MCP configuration without forwarding tool output', async (t) => {
   const { runner, capture, dir } = await setup(t);
   const saved = [];
   const prompt = '请分析 `echo secret` 和 $(touch injected) 原样文字';
@@ -47,10 +47,11 @@ test('new task uses stdin, exact workspace and isolated config without forwardin
   assert.equal(call.prompt, prompt);
   assert.equal(call.cwd, await realpath(dir));
   assert.ok(!call.args.includes(prompt));
-  assert.ok(call.args.includes('--ignore-user-config'));
+  assert.ok(!call.args.includes('--ignore-user-config'));
   assert.equal(call.args[call.args.indexOf('--cd') + 1], dir);
   assert.equal(call.args[call.args.indexOf('--sandbox') + 1], 'workspace-write');
-  assert.ok(call.args.includes('approval_policy="never"'));
+  assert.ok(call.args.includes('approval_policy="on-request"'));
+  assert.ok(call.args.includes('approvals_reviewer="auto_review"'));
   assert.ok(!call.args.some((arg) => arg.startsWith('model_reasoning_effort=')));
   assert.ok(!call.args.some((arg) => arg.includes('bypass')));
   assert.equal(runner.cancel(), false);
@@ -67,7 +68,8 @@ test('new and resumed tasks keep the model and reasoning effort, with explicit s
   assert.equal(newTask.sessionId, ID);
   assert.equal((await runner.run({ prompt: '继续', sessionId: ID })).sessionId, ID);
   const { args } = JSON.parse(await readFile(capture, 'utf8'));
-  assert.deepEqual(args.slice(args.indexOf('resume')), ['resume', '--json', '--skip-git-repo-check', '--ignore-user-config', ID, '-']);
+  assert.deepEqual(args.slice(args.indexOf('resume')), ['resume', '--json', '--skip-git-repo-check', ID, '-']);
+  assert.ok(!args.includes('--ignore-user-config'));
   assert.ok(!args.includes('--last'));
   assert.equal(args[args.indexOf('--cd') + 1], dir);
   assert.equal(args[args.indexOf('--sandbox') + 1], 'read-only');

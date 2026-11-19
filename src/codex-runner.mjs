@@ -45,13 +45,14 @@ export class CodexRunner {
       throw fail('CODEX_CONFIGURATION', '保存的 Codex 会话编号无效，请使用 /new 新建会话。');
     }
     // Explicit exec-level cwd/permission overrides also apply to resumed sessions.
-    // Ignoring user configuration keeps saved auth but excludes inherited MCPs.
-    const args = ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config',
+    // Load the user's Codex configuration, including its configured MCP servers.
+    const args = ['exec', '--json', '--skip-git-repo-check',
       '--color', 'never', '--cd', this.workspace, '--sandbox', this.sandbox,
-      '-c', 'approval_policy="never"', '-c', `sandbox_mode="${this.sandbox}"`];
+      '-c', 'approval_policy="on-request"', '-c', 'approvals_reviewer="auto_review"',
+      '-c', `sandbox_mode="${this.sandbox}"`];
     if (this.model) args.push('--model', this.model);
     if (this.reasoningEffort) args.push('-c', `model_reasoning_effort="${this.reasoningEffort}"`);
-    if (sessionId) args.push('resume', '--json', '--skip-git-repo-check', '--ignore-user-config', sessionId, '-');
+    if (sessionId) args.push('resume', '--json', '--skip-git-repo-check', sessionId, '-');
     else args.push('-');
 
     return new Promise((resolveRun, rejectRun) => {

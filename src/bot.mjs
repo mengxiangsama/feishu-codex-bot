@@ -344,6 +344,16 @@ export class Bot {
     try {
       const result = await this.teamRunner.run({
         prompt: job.text,
+        sessionId: this.state.sessions[job.key],
+        onThread: id => {
+          if (job.cancelled || this.closed || this.failed) return;
+          if (typeof id !== 'string' || !id || id.length > 200) {
+            this.failState(job.messageId);
+            return;
+          }
+          try { this.state.sessions[job.key] = id; this.persist(); }
+          catch { this.failState(job.messageId); }
+        },
         onStage: async (stage, workerName) => {
           if (job.cancelled || this.closed || this.failed) return;
           const message = stage === 'execute'

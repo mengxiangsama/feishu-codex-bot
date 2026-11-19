@@ -366,6 +366,36 @@ function teamEvent(task, overrides = {}) {
   return event(`@_user_1 /协作 ${task}`, { ...teamGroup, ...overrides });
 }
 
+test('team conversation saves its leader session and reuses it for the next request until reset', async t => {
+  const seen = [];
+  const { bot, stateFile } = fixture(t, {
+    teamChatId: teamGroup.chat,
+    teamRunner: {
+      async run({ prompt, sessionId, onThread }) {
+        seen.push({ prompt, sessionId });
+        onThread('team-session-1');
+        return { text: '完成' };
+      },
+      cancel() { return false; },
+    },
+  });
+  await bind(bot);
+  bot.handleEvent(teamEvent('修改 README'));
+  await bot.idle();
+  assert.ok(Object.values(JSON.parse(readFileSync(stateFile)).sessions).includes('team-session-1'));
+  bot.handleEvent(teamEvent('发布上次修改'));
+  await bot.idle();
+  assert.deepEqual(seen, [
+    { prompt: '修改 README', sessionId: undefined },
+    { prompt: '发布上次修改', sessionId: 'team-session-1' },
+  ]);
+  bot.handleEvent(event('@_user_1 /new', teamGroup));
+  await bot.idle();
+  bot.handleEvent(teamEvent('新任务'));
+  await bot.idle();
+  assert.equal(seen[2].sessionId, undefined);
+});
+
 test('ordinary mentions default to teamwork only for the paired owner in the configured group', async t => {
   const tasks = [];
   const info = [];
