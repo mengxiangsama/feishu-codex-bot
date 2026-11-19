@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 import { Bot } from '../src/bot.mjs';
 
 let messageCounter = 0;
+const fixtureMention = { key: '@_user_1', id: { open_id: 'ou_fixture' } };
+
 function event(text, options = {}) {
   return {
     sender: { sender_type: options.senderType ?? 'user', sender_id: { open_id: options.sender ?? 'ou_owner' } },
@@ -53,7 +55,7 @@ function fixture(t, options = {}) {
   };
   const stateFile = join(directory, 'data', 'state.json');
   const bot = new Bot({
-    stateFile, runner, messenger, workspace: '/test/workspace',
+    stateFile, runner, messenger, botOpenId: 'ou_fixture', workspace: '/test/workspace',
     logger: { error(message) { logs.push(message); } },
     ...options,
   });
@@ -74,7 +76,7 @@ test('binding requires private chat and correct code; only the owner can execute
   const code = bot.pairingCode;
   assert.match(code, /^[a-f0-9]{12}$/);
   bot.handleEvent(event(`@_user_1 /pair ${code}`, {
-    chatType: 'group', mentions: [{ key: '@_user_1' }],
+    chatType: 'group', mentions: [fixtureMention],
   }));
   await bot.idle();
   assert.equal(bot.ownerOpenId, null);
@@ -140,7 +142,7 @@ test('FIFO preserves continuation and isolates group and private chat sessions',
   bot.handleEvent(event('second'));
   bot.handleEvent(event('ignored unmentioned group', { chat: 'oc_group', chatType: 'group' }));
   bot.handleEvent({ event: event('@_user_1 group first', {
-    chat: 'oc_group', chatType: 'group', mentions: [{ key: '@_user_1' }],
+    chat: 'oc_group', chatType: 'group', mentions: [fixtureMention],
   }) });
   bot.handleEvent(event('third'));
   await bot.idle();
@@ -496,7 +498,7 @@ test('configured persona is included on each turn while preserving the exact loc
   assert.ok(replies.some(reply => reply.text.includes('DevBot')));
 });
 
-const teamGroup = { chat: 'oc_team_group', chatType: 'group', mentions: [{ key: '@_user_1' }] };
+const teamGroup = { chat: 'oc_team_group', chatType: 'group', mentions: [fixtureMention] };
 function teamEvent(task, overrides = {}) {
   return event(`@_user_1 /协作 ${task}`, { ...teamGroup, ...overrides });
 }
@@ -806,4 +808,273 @@ test('a new session is refused when collaboration is queued or running', async t
   assert.match(replies.find(reply => reply.messageId === reset.message.message_id).text, /仍有协作任务/);
   finish.resolve();
   await bot.idle();
+});
+
+const plainTeamGroup = { chat: teamGroup.chat, chatType: 'group' };
+
+test('a failed startup Open ID lookup retries and resumes exact mention routing', async t => {
+  const initial = deferred();
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const warnings = [];
+  const { bot, calls, messenger, replies, stateFile } = fixture(t, {
+    botOpenId: null,
+    logger: { warn(message) { warnings.push(message); } },
+  });
+  const getBotOpenId = t.mock.fn(() => initial.promise);
+  messenger.getBotOpenId = getBotOpenId;
+  const startup = bot.refreshBotOpenId();
+  await bot.refreshBotOpenId();
+  assert.equal(getBotOpenId.mock.callCount(), 1);
+  initial.reject(new Error('network unavailable'));
+  await startup;
+  assert.equal(warnings.length, 1);
+
+  await bind(bot);
+  const self = event('@_user_1 给机器人', { ...plainTeamGroup, mentions: [fixtureMention] });
+  const other = event('@_user_1 给其他人', {
+    ...plainTeamGroup, mentions: [{ key: '@_user_1', id: { open_id: 'ou_other' } }],
+  });
+  bot.handleEvent(self);
+  bot.handleEvent(other);
+  bot.handleEvent(event('私聊正常'));
+  await bot.idle();
+  assert.deepEqual(calls.map(call => call.prompt), ['私聊正常']);
+  assert.ok(!JSON.parse(readFileSync(stateFile, 'utf8')).processed.includes(self.message.message_id));
+
+  getBotOpenId.mock.mockImplementation(async () => fixtureMention.id.open_id);
+  await bot.refreshBotOpenId();
+  assert.equal(getBotOpenId.mock.callCount(), 1);
+  now += 5000;
+  await bot.refreshBotOpenId();
+  await bot.refreshBotOpenId();
+  assert.equal(getBotOpenId.mock.callCount(), 2);
+
+  bot.handleEvent(other);
+  bot.handleEvent(self);
+  bot.handleEvent(self);
+  await bot.idle();
+  assert.deepEqual(calls.map(call => call.prompt), ['私聊正常', '给机器人']);
+  assert.ok(!replies.some(reply => reply.messageId === other.message.message_id));
+  assert.ok(!JSON.parse(readFileSync(stateFile, 'utf8')).processed.includes(other.message.message_id));
+});
+
+test('no-mention teamwork routes a first message and follow-up only to the leader, once per message', async t => {
+  const tasks = [];
+  const leader = fixture(t, {
+    botName: 'Leader',
+    botOpenId: 'ou_leader',
+    teamChatId: teamGroup.chat,
+    teamNoMention: true,
+    teamRunner: {
+      async run({ prompt, sessionId, onThread }) {
+        tasks.push({ prompt, sessionId });
+        onThread('leader-session');
+        return { text: '团队结果' };
+      },
+      cancel() { return false; },
+    },
+  });
+  const worker = fixture(t, { botName: 'Worker', botOpenId: 'ou_worker' });
+  leader.bot.handleEvent(event('绑定前的群消息', plainTeamGroup));
+  await leader.bot.idle();
+  assert.deepEqual(leader.replies, []);
+  await bind(leader.bot);
+  await bind(worker.bot);
+
+  const first = event('写使用说明', plainTeamGroup);
+  delete first.message.mentions;
+  leader.bot.handleEvent({ header: { event_id: 'evt_first' }, event: first });
+  leader.bot.handleEvent({ header: { event_id: 'evt_retry' }, event: first });
+  worker.bot.handleEvent(first);
+  await leader.bot.idle();
+
+  const followUp = event('补上安装步骤', plainTeamGroup);
+  followUp.message.root_id = first.message.message_id;
+  leader.bot.handleEvent(followUp);
+  worker.bot.handleEvent(followUp);
+  await Promise.all([leader.bot.idle(), worker.bot.idle()]);
+
+  assert.deepEqual(tasks, [
+    { prompt: '写使用说明', sessionId: undefined },
+    { prompt: '补上安装步骤', sessionId: 'leader-session' },
+  ]);
+  assert.deepEqual(leader.calls, []);
+  assert.deepEqual(worker.calls, []);
+  assert.equal(worker.replies.length, 1);
+  for (const message of [first, followUp]) {
+    assert.deepEqual(leader.replies.filter(reply => reply.messageId === message.message.message_id).map(reply => reply.text), [
+      '已收到，Leader 正在处理。', '协作汇报\n团队结果',
+    ]);
+  }
+});
+
+test('no-mention teamwork filters other senders, open IDs and groups while keeping explicit routing', async t => {
+  const tasks = [];
+  const leader = fixture(t, {
+    botName: 'Leader',
+    botOpenId: 'ou_leader',
+    teamChatId: teamGroup.chat,
+    teamNoMention: true,
+    teamRunner: {
+      async run({ prompt }) { tasks.push(prompt); return { text: '团队结果' }; },
+      cancel() { return false; },
+    },
+  });
+  const worker = fixture(t, { botOpenId: 'ou_worker' });
+  await bind(leader.bot);
+  await bind(worker.bot);
+
+  const otherGroup = { ...plainTeamGroup, chat: 'oc_other_group' };
+  const mentionLeader = [{ key: '@_user_1', id: { open_id: 'ou_leader' } }];
+  const mentionOther = [{ key: '@_user_1', name: 'Leader', id: { open_id: 'ou_other' } }];
+  const directedToWorker = event('@_user_1 执行者单独处理', {
+    ...plainTeamGroup, mentions: [{ key: '@_user_1', id: { open_id: 'ou_worker' } }],
+  });
+  const ignored = [
+    event('其他成员', { ...plainTeamGroup, sender: 'ou_other' }),
+    event('其他机器人', { ...plainTeamGroup, senderType: 'app' }),
+    event('其他群普通消息', otherGroup),
+    event('@_user_1 同名成员', { ...plainTeamGroup, mentions: mentionOther }),
+    event('@_user_1 其他群里的其他成员', { ...otherGroup, mentions: mentionOther }),
+    event('@_all 全体成员', { ...plainTeamGroup, mentions: [{ key: '@_all', id: { open_id: 'all' } }] }),
+    directedToWorker,
+  ];
+  for (const message of ignored) {
+    leader.bot.handleEvent(message);
+    worker.bot.handleEvent(message);
+  }
+  leader.bot.handleEvent(event('负责人私聊'));
+  leader.bot.handleEvent(event('@_user_1 其他群单独处理', { ...otherGroup, mentions: mentionLeader }));
+  leader.bot.handleEvent(event('@_user_1 协作继续', { ...plainTeamGroup, mentions: mentionLeader }));
+  await Promise.all([leader.bot.idle(), worker.bot.idle()]);
+
+  assert.deepEqual(tasks, ['协作继续']);
+  assert.deepEqual(leader.calls.map(call => call.prompt), ['负责人私聊', '其他群单独处理']);
+  assert.deepEqual(worker.calls.map(call => call.prompt), ['执行者单独处理']);
+  const processed = JSON.parse(readFileSync(leader.stateFile, 'utf8')).processed;
+  for (const { message } of ignored) {
+    assert.ok(!processed.includes(message.message_id));
+    assert.ok(!leader.replies.some(reply => reply.messageId === message.message_id));
+  }
+});
+
+test('turning off no-mention teamwork restores mention-only routing for the same bound leader', async t => {
+  const tasks = [];
+  const options = {
+    botOpenId: 'ou_leader',
+    teamChatId: teamGroup.chat,
+    teamRunner: {
+      async run({ prompt }) { tasks.push(prompt); return { text: '团队结果' }; },
+      cancel() { return false; },
+    },
+  };
+  const first = fixture(t, { ...options, teamNoMention: true });
+  await bind(first.bot);
+  first.bot.handleEvent(event('开启时普通发言', plainTeamGroup));
+  await first.bot.idle();
+  await first.bot.close();
+
+  const restarted = new Bot({
+    ...options, teamNoMention: false, stateFile: first.stateFile, runner: first.runner, messenger: first.messenger,
+    logger: {},
+  });
+  t.after(() => restarted.close());
+  const ignored = [
+    event('关闭后普通发言', plainTeamGroup),
+    event('@_user_1 关闭后提及其他人', { ...plainTeamGroup, mentions: [{ key: '@_user_1', id: { open_id: 'ou_other' } }] }),
+  ];
+  for (const message of ignored) restarted.handleEvent(message);
+  restarted.handleEvent(event('@_user_1 关闭后直接提及负责人', {
+    ...plainTeamGroup, mentions: [{ key: '@_user_1', id: { open_id: 'ou_leader' } }],
+  }));
+  await restarted.idle();
+
+  assert.deepEqual(tasks, ['开启时普通发言', '关闭后直接提及负责人']);
+  for (const { message } of ignored) assert.ok(!first.replies.some(reply => reply.messageId === message.message_id));
+});
+
+test('no-mention teamwork downloads images from standalone and rich-text messages', async t => {
+  const tasks = [];
+  const downloads = [];
+  const { bot, calls, messenger } = fixture(t, {
+    botOpenId: 'ou_leader',
+    teamChatId: teamGroup.chat,
+    teamNoMention: true,
+    teamRunner: {
+      async run({ prompt, images }) {
+        tasks.push({ prompt, contents: images.map(path => readFileSync(path, 'utf8')) });
+        return { text: '团队结果' };
+      },
+      cancel() { return false; },
+    },
+  });
+  messenger.downloadImage = async (messageId, key, directory) => {
+    downloads.push({ messageId, key, directory });
+    const path = join(directory, `${key}.png`);
+    writeFileSync(path, key);
+    return path;
+  };
+  await bind(bot);
+  const image = imageEvent('img_only', plainTeamGroup);
+  bot.handleEvent(image);
+  await bot.idle();
+  const post = postEvent({ content: [[{ tag: 'text', text: '读取短码' }, { tag: 'img', image_key: 'img_code' }]] }, plainTeamGroup);
+  bot.handleEvent(post);
+  bot.handleEvent(post);
+  await bot.idle();
+
+  assert.deepEqual(calls, []);
+  assert.deepEqual(tasks, [
+    { prompt: '请描述这条消息中的图片。', contents: ['img_only'] },
+    { prompt: '读取短码', contents: ['img_code'] },
+  ]);
+  assert.deepEqual(downloads.map(({ messageId, key }) => [messageId, key]), [
+    [image.message.message_id, 'img_only'], [post.message.message_id, 'img_code'],
+  ]);
+  assert.ok(downloads.every(({ directory }) => !existsSync(directory)));
+});
+
+test('a no-mention /stop cancels active teamwork and clears queued work only for the bound owner', async t => {
+  const teamResult = deferred();
+  const tasks = [];
+  const cancellations = [];
+  const { bot, calls, replies } = fixture(t, {
+    botOpenId: 'ou_leader',
+    teamChatId: teamGroup.chat,
+    teamNoMention: true,
+    teamRunner: {
+      async run({ prompt, onStage }) {
+        tasks.push(prompt);
+        const result = await teamResult.promise;
+        await onStage('review');
+        return result;
+      },
+      cancel(jobId) {
+        cancellations.push(jobId);
+        teamResult.resolve({ text: '晚到结果' });
+        return true;
+      },
+    },
+  });
+  await bind(bot);
+  const active = event('正在执行', plainTeamGroup);
+  bot.handleEvent(active);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(tasks, ['正在执行']);
+
+  bot.handleEvent(event('/stop', { ...plainTeamGroup, sender: 'ou_other' }));
+  bot.handleEvent(event('/stop', { ...plainTeamGroup, chat: 'oc_other_group' }));
+  assert.deepEqual(cancellations, []);
+  bot.handleEvent(event('排队任务', plainTeamGroup));
+  bot.handleEvent(event('保留私聊'));
+  const stop = event('/stop', plainTeamGroup);
+  bot.handleEvent(stop);
+  await bot.idle();
+
+  assert.deepEqual(cancellations, [active.message.message_id]);
+  assert.deepEqual(tasks, ['正在执行']);
+  assert.deepEqual(calls.map(call => call.prompt), ['保留私聊']);
+  assert.ok(!replies.some(reply => /晚到结果|审查结果/.test(reply.text)));
+  assert.match(replies.find(reply => reply.messageId === stop.message.message_id).text, /已停止.*取消 1 条等待任务/);
 });

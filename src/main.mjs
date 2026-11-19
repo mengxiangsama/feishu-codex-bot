@@ -133,6 +133,7 @@ function loadTeam(mappings, bots) {
     const leader = mappings.find(({ appId }) => appId === team.leaderAppId);
     const workerIds = team.workerAppIds ?? [team.workerAppId];
     if (team.version !== 1 || typeof team.chatId !== 'string' || !/^oc_[A-Za-z0-9]+$/.test(team.chatId) ||
+        (team.noMention !== undefined && typeof team.noMention !== 'boolean') ||
         !leader || !Array.isArray(workerIds) || !workerIds.length ||
         new Set(workerIds).size !== workerIds.length || workerIds.includes(leader.appId)) {
       throw new Error('invalid team');
@@ -164,8 +165,9 @@ function loadTeam(mappings, bots) {
         }
       },
     });
-    console.log(`协作模式已启用：${leader.name} 负责，执行者：${workers.map(({ name }) => name).join('、')}。`);
-    return { leaderAppId: leader.appId, chatId: team.chatId, runner: teamRunner };
+    const noMention = team.noMention === true;
+    console.log(`协作模式已启用：${leader.name} 负责，执行者：${workers.map(({ name }) => name).join('、')}。协作群免 @：${noMention ? '开启' : '关闭'}。`);
+    return { leaderAppId: leader.appId, chatId: team.chatId, runner: teamRunner, noMention };
   } catch (error) {
     if (error.code !== 'ENOENT') console.warn('协作模式未启用。请检查本机 team.json，并启动配置的负责人和执行者。');
     return null;
@@ -211,6 +213,7 @@ async function start() {
         ...(team?.leaderAppId === config.appId && {
           teamRunner: team.runner,
           teamChatId: team.chatId,
+          teamNoMention: team.noMention,
         }),
         logger: {
           info: (message) => console.log(logPrefix + message),
@@ -220,6 +223,7 @@ async function start() {
       });
       bots.set(config.appId, bot);
       connections.push({ config, bot, code: bot.pairingCode, label: logPrefix });
+      void bot.refreshBotOpenId();
     } catch (error) {
       console.error(logPrefix + '启动失败。' + error.message);
     }
@@ -246,6 +250,7 @@ async function start() {
 
   timer = setInterval(() => {
     for (const connection of connections) {
+      void connection.bot.refreshBotOpenId();
       const state = connection.ws?.getConnectionStatus().state;
       if (state !== connection.status) {
         connection.status = state;

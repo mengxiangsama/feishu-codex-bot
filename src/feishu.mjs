@@ -26,14 +26,14 @@ export async function connectFeishu(config, onMessage) {
   return ws.start({ eventDispatcher }).then(() => ws);
 }
 
-async function post(path, payload, token) {
+async function request(path, { method, payload, token }) {
   const headers = { 'Content-Type': 'application/json; charset=utf-8' };
   if (token) headers.Authorization = 'Bearer ' + token;
 
   let response;
   try {
     response = await fetch(API + path, {
-      method: 'POST',
+      method,
       headers,
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(10000),
@@ -81,9 +81,9 @@ export function makeMessenger(config) {
   let pendingToken;
   async function token() {
     if (cachedToken?.expiresAt > Date.now()) return cachedToken.value;
-    pendingToken ??= post('/auth/v3/tenant_access_token/internal', {
-      app_id: config.appId,
-      app_secret: config.appSecret,
+    pendingToken ??= request('/auth/v3/tenant_access_token/internal', {
+      method: 'POST',
+      payload: { app_id: config.appId, app_secret: config.appSecret },
     }).then((data) => {
       if (!data.tenant_access_token || !Number.isFinite(data.expire)) {
         throw new Error('飞书返回了无效的应用凭证响应。');
@@ -113,6 +113,13 @@ export function makeMessenger(config) {
 
   return {
     async check() { await token(); },
+    async getBotOpenId() {
+      const { bot } = await request('/bot/v3/info', { method: 'GET', token: await token() });
+      if (typeof bot?.open_id !== 'string' || !/^ou_\S+$/.test(bot.open_id)) {
+        throw new Error('飞书未返回有效的机器人 Open ID。');
+      }
+      return bot.open_id;
+    },
     async downloadImage(messageId, imageKey, directory, { signal } = {}) {
       if ([messageId, imageKey].some((value) => typeof value !== 'string' || !value || value === '.' || value === '..')) {
         throw imageError('飞书图片消息缺少有效的下载信息，请重新发送。');
@@ -174,11 +181,15 @@ export function makeMessenger(config) {
       const total = Math.ceil(chars.length / chunkSize);
       for (let part = 0; part < total; part++) {
         const prefix = total === 1 ? '' : '[' + (part + 1) + '/' + total + '] ';
-        await post('/im/v1/messages/' + encodeURIComponent(messageId) + '/reply', {
-          msg_type: 'text',
-          content: JSON.stringify({ text: prefix + chars.slice(part * chunkSize, (part + 1) * chunkSize).join('') }),
-          uuid: randomUUID(),
-        }, accessToken);
+        await request('/im/v1/messages/' + encodeURIComponent(messageId) + '/reply', {
+          method: 'POST',
+          token: accessToken,
+          payload: {
+            msg_type: 'text',
+            content: JSON.stringify({ text: prefix + chars.slice(part * chunkSize, (part + 1) * chunkSize).join('') }),
+            uuid: randomUUID(),
+          },
+        });
       }
     },
   };

@@ -23,6 +23,25 @@ function mockFeishu(t, resource) {
   });
 }
 
+test('loads the application bot Open ID using its existing tenant token', async (t) => {
+  const fetch = mockFeishu(t, () => Response.json({ code: 0, bot: { open_id: 'ou_mock' } }));
+  const messenger = makeMessenger(config);
+  await messenger.check();
+  assert.equal(await messenger.getBotOpenId(), 'ou_mock');
+
+  assert.equal(fetch.mock.callCount(), 2);
+  const [url, options] = fetch.mock.calls[1].arguments;
+  assert.equal(url, 'https://open.feishu.cn/open-apis/bot/v3/info');
+  assert.equal(options.method, 'GET');
+  assert.equal(options.headers.Authorization, 'Bearer mock_token');
+  assert.equal(options.body, undefined);
+});
+
+test('rejects a bot info response without an Open ID', async (t) => {
+  mockFeishu(t, () => Response.json({ code: 0, bot: { app_name: 'Mock Bot' } }));
+  await assert.rejects(makeMessenger(config).getBotOpenId(), /有效的机器人 Open ID/);
+});
+
 test('downloads message image bytes with the current app token and uses separate private files', async (t) => {
   const directory = await makeDirectory(t);
   const fetch = mockFeishu(t, () => new Response(png, { headers: { 'Content-Type': 'application/octet-stream' } }));

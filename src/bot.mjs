@@ -6,6 +6,7 @@ import { dirname, resolve } from 'node:path';
 
 const MAX_PROCESSED = 2000;
 const MAX_TEXT = 12000;
+const BOT_OPEN_ID_RETRY_MS = 5000;
 const HELP = '发送文字、图片或图文消息即可连续对话。\n/new — 开始新对话\n/status — 查看状态\n/help — 查看帮助\n电脑和本地程序需要保持运行。';
 const IMAGE_PROMPT = '请描述这条消息中的图片。';
 const TEAM_COMMAND = /^\/协作(?:\s+([\s\S]*))?$/;
@@ -82,8 +83,9 @@ function parseMessage(message) {
 /** Routes Feishu events to one local Codex worker, with images staged only for active jobs. */
 export class Bot {
   #teamReservation;
+  #nextBotOpenIdAttemptAt = 0;
 
-  constructor({ stateFile, runner, messenger, botName, persona, teamRunner, teamChatId,
+  constructor({ stateFile, runner, messenger, botName, botOpenId = null, persona, teamRunner, teamChatId, teamNoMention = false,
     logger = console, maxQueue = 8 }) {
     if (!stateFile || !runner?.run || !runner?.cancel || !messenger?.reply ||
         !Number.isInteger(maxQueue) || maxQueue < 1) {
@@ -97,12 +99,19 @@ export class Bot {
     this.runner = runner;
     this.messenger = messenger;
     this.botName = typeof botName === 'string' ? botName.trim() : '';
+    this.botOpenId = botOpenId;
     this.persona = typeof persona === 'string' ? persona.trim() : '';
     this.workerLabel = this.botName || '本机 Codex';
     this.teamRunner = teamRunner;
     this.teamChatId = teamChatId;
+    this.teamNoMention = teamNoMention;
     const stopHelp = '/stop — 停止当前会话的本机 Codex 进程，并清空其等待队列。';
-    const teamHelp = teamRunner ? '\n在指定群 @ 我并直接发任务，即会启动协作。' : '';
+    let teamHelp = '';
+    if (teamRunner) {
+      teamHelp = teamNoMention
+        ? '\n在指定协作群直接发任务或追问即可，无需 @。'
+        : '\n在指定群 @ 我并直接发任务，即会启动协作。';
+    }
     this.helpText = `你正在与 ${this.workerLabel} 对话，任务由本机 Codex 处理。${HELP}\n${stopHelp}${teamHelp}`;
     this.logger = logger;
     this.maxQueue = maxQueue;
@@ -132,6 +141,20 @@ export class Bot {
   get pairingCode() { return this.state.ownerOpenId ? undefined : this.state.pairingCode; }
   get ownerOpenId() { return this.state.ownerOpenId; }
   get canAcceptTeamWork() { return !this.closed && !this.failed; }
+
+  async refreshBotOpenId() {
+    if (this.closed || this.botOpenId || Date.now() < this.#nextBotOpenIdAttemptAt) return;
+    const firstAttempt = this.#nextBotOpenIdAttemptAt === 0;
+    this.#nextBotOpenIdAttemptAt = Infinity;
+    try {
+      this.botOpenId = await this.messenger.getBotOpenId();
+    } catch {
+      this.#nextBotOpenIdAttemptAt = Date.now() + BOT_OPEN_ID_RETRY_MS;
+      if (firstAttempt && !this.closed) {
+        this.log('无法获取机器人 Open ID，将自动重试。期间暂不处理群里的 @ 消息。', 'warn');
+      }
+    }
+  }
 
   get #isIdle() {
     return !this.draining && !this.scheduled && !this.queue.length && !this.teamJobs.size && !this.pendingReplies.size && !this.#teamReservation;
@@ -211,10 +234,15 @@ export class Bot {
     const messageId = message?.message_id;
     if (sender?.sender_type !== 'user' || typeof senderId !== 'string' || !senderId ||
         typeof messageId !== 'string' || !messageId || typeof message?.chat_id !== 'string' || !message.chat_id) return;
-    if (message.chat_type !== 'p2p' && message.chat_type !== 'group') return;
-    const mentions = Array.isArray(message.mentions) ? message.mentions : [];
-    if (message.chat_type === 'group' && mentions.length === 0) return;
+    const isGroup = message.chat_type === 'group';
+    if (message.chat_type !== 'p2p' && !isGroup) return;
     if (this.state.ownerOpenId && senderId !== this.state.ownerOpenId) return;
+    const inTeamGroup = Boolean(this.teamRunner && isGroup && message.chat_id === this.teamChatId);
+    const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+    if (isGroup && mentions.length === 0 && !(inTeamGroup && this.teamNoMention && this.state.ownerOpenId)) return;
+    // With all-group delivery, a mention can target a different user or bot.
+    if (isGroup && mentions.length &&
+        !(this.botOpenId && mentions.some(mention => mention?.id?.open_id === this.botOpenId))) return;
     if (this.seen.has(messageId)) return;
     if (this.failed) {
       void this.reply(messageId, '本地状态不可用，请在电脑上检查后重启程序。');
@@ -269,7 +297,6 @@ export class Bot {
     }
 
     const key = JSON.stringify([message.chat_id, senderId]);
-    const inTeamGroup = Boolean(this.teamRunner && message.chat_type === 'group' && message.chat_id === this.teamChatId);
     const teamCommand = TEAM_COMMAND.exec(text);
     const teamTask = teamCommand?.[1]?.trim();
     if (/^\/pair(?:\s|$)/i.test(text)) {
