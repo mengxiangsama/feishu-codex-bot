@@ -47,6 +47,7 @@ test('new task uses stdin, exact workspace and user MCP configuration without fo
   assert.equal(call.prompt, prompt);
   assert.equal(call.cwd, await realpath(dir));
   assert.ok(!call.args.includes(prompt));
+  assert.ok(!call.args.includes('--image'));
   assert.ok(!call.args.includes('--ignore-user-config'));
   assert.equal(call.args[call.args.indexOf('--cd') + 1], dir);
   assert.equal(call.args[call.args.indexOf('--sandbox') + 1], 'workspace-write');
@@ -75,6 +76,27 @@ test('new and resumed tasks keep the model and reasoning effort, with explicit s
   assert.equal(args[args.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(args[args.indexOf('--model') + 1], 'test-model');
   assert.ok(args.slice(0, args.indexOf('resume')).includes('model_reasoning_effort="ultra"'));
+});
+
+test('new and resumed tasks attach only their current images and keep the prompt on stdin', async (t) => {
+  const { runner, capture, dir } = await setup(t);
+  const first = join(dir, '第一张 图片.png');
+  const second = join(dir, 'second image.jpg');
+  const latest = join(dir, 'new screenshot.png');
+
+  await runner.run({ prompt: '比较两张图。', images: [first, second] });
+  const initialCall = JSON.parse(await readFile(capture, 'utf8'));
+  assert.deepEqual(initialCall.args.slice(0, 6), ['exec', '--image', first, '--image', second, '--json']);
+  assert.equal(initialCall.args.at(-1), '-');
+  assert.equal(initialCall.prompt, '比较两张图。');
+
+  await runner.run({ prompt: '读出这张图的短码。', sessionId: ID, images: [latest] });
+  const resumedCall = JSON.parse(await readFile(capture, 'utf8'));
+  assert.deepEqual(resumedCall.args.slice(resumedCall.args.indexOf('resume')),
+    ['resume', '--image', latest, '--json', '--skip-git-repo-check', ID, '-']);
+  assert.ok(!resumedCall.args.includes(first));
+  assert.ok(!resumedCall.args.includes(second));
+  assert.equal(resumedCall.prompt, '读出这张图的短码。');
 });
 
 test('CLI failures do not expose raw event errors or stderr and retain their session', async (t) => {
@@ -126,10 +148,12 @@ test('session persistence failure stops the task without forwarding the callback
   });
 });
 
-test('missing CLI and invalid session identifiers fail before running user work', async (t) => {
-  const { runner } = await setup(t, 'success', { codexBin: '/nonexistent/feishu-codex-cli' });
+test('missing CLI and invalid session identifiers or image paths fail before running user work', async (t) => {
+  const { runner, dir } = await setup(t, 'success', { codexBin: '/nonexistent/feishu-codex-cli' });
   await assert.rejects(runner.run({ prompt: '测试' }), { code: 'CODEX_NOT_FOUND' });
   await assert.rejects(runner.run({ prompt: '测试', sessionId: '--last' }), { code: 'CODEX_CONFIGURATION' });
+  await assert.rejects(runner.run({ prompt: '测试', images: ['relative.png'] }), { code: 'CODEX_CONFIGURATION' });
+  await assert.rejects(runner.run({ prompt: '测试', images: [join(dir, 'a,b.png')] }), { code: 'CODEX_CONFIGURATION' });
 });
 
 test('an unresponsive asynchronous persistence callback still respects timeout', async (t) => {

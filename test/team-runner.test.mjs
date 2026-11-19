@@ -110,12 +110,24 @@ test('plans, executes, and reviews in the configured project directory using the
   assert.match(calls[1].prompt, /Codex Sol 2/);
   assert.match(calls[2].prompt, /Codex Sol 2/);
   assert.ok(calls.every(call => call.prompt.includes(JSON.stringify(prompt))));
+  assert.ok(calls.every(call => !Object.hasOwn(call, 'images')));
   assert.match(calls[1].prompt, /负责人的方案.*Astra 方案/);
   assert.match(calls[2].prompt, /执行者的交付报告.*Sol 输出/);
 
   await runner.run({ prompt: '新的协作任务' });
   assert.equal(calls[3].workspace, calls[0].workspace);
   assert.equal(calls[3].sessionId, undefined);
+});
+
+test('planning, execution, and review receive the same original image paths', async t => {
+  const { root, calls, runner } = await fixture(t);
+  const images = [join(root, '原图 1.png'), join(root, '原图 2.png')];
+  await runner.run({ prompt: '这两张图分别写了什么？', images });
+  assert.deepEqual(calls.map(call => [call.role, call.sessionId, call.images]), [
+    ['leader', undefined, images],
+    ['worker', undefined, images],
+    ['leader', 'leader-session', images],
+  ]);
 });
 
 test('later collaboration receives the previous leader session and sees prior project changes', async t => {
@@ -178,17 +190,21 @@ test('cancel stops the active worker, skips review and allows a subsequent task'
     },
     workerCancel: () => {
       cancellations++;
-      releaseWorker({ text: '停止时已有的中间结果。' });
       return true;
     },
   });
 
   const result = runner.run({ prompt: '测试任务' });
   await started;
-  await assert.rejects(runner.run({ prompt: '同时启动的任务' }), { code: 'TEAM_BUSY' });
+  let runSettled = false;
+  const cancelled = assert.rejects(result, { code: 'TEAM_CANCELLED' }).then(() => { runSettled = true; });
   assert.equal(runner.cancel(), true);
   assert.equal(runner.cancel(), false);
-  await assert.rejects(result, { code: 'TEAM_CANCELLED' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(runSettled, false);
+  assert.deepEqual(reservations, ['acquire']);
+  releaseWorker({ text: '停止时已有的中间结果。' });
+  await cancelled;
   assert.equal(cancellations, 1);
   assert.deepEqual(calls.map(call => call.role), ['leader', 'worker']);
   assert.deepEqual(reservations, ['acquire', 'release']);
@@ -255,4 +271,100 @@ test('long execution reports are bounded while retaining the beginning and end',
   assert.match(calls[2].prompt, /末尾/);
   assert.match(calls[2].prompt, /中间已省略/);
   assert.ok(calls[2].prompt.length < 17000);
+});
+
+test('while a worker is busy the leader answers a follow-up and dispatches a second task', async t => {
+  const started = Promise.withResolvers();
+  const releaseFirst = Promise.withResolvers();
+  const secondStarted = Promise.withResolvers();
+  let activeLeaders = 0;
+  let maxLeaders = 0;
+  let workerCount = 0;
+  let session;
+  const { runner, calls } = await fixture(t, {
+    async leaderRun(args) {
+      activeLeaders++;
+      maxLeaders = Math.max(maxLeaders, activeLeaders);
+      await new Promise(resolve => setImmediate(resolve));
+      activeLeaders--;
+      if (args.prompt.includes('继续作为协作负责人')) return { text: '已审查', sessionId: 'leader-session' };
+      args.onThread?.('leader-session');
+      if (args.prompt.includes('找到问题了吗')) {
+        assert.match(args.prompt, /"stage":"execute"/);
+        return { text: JSON.stringify({ action: 'answer', text: '执行机器人仍在处理，结果尚未确认。' }), sessionId: 'leader-session' };
+      }
+      return { text: JSON.stringify({ action: 'delegate', text: '完成并检查任务' }), sessionId: 'leader-session' };
+    },
+    async workerRun() {
+      workerCount++;
+      if (workerCount === 1) { started.resolve(); await releaseFirst.promise; }
+      else secondStarted.resolve();
+      return { text: '执行结束' };
+    },
+  });
+  const common = { getSession: () => session, onThread: id => { session = id; } };
+  const first = runner.run({ prompt: '修改图片功能', jobId: 'one', ...common });
+  await started.promise;
+  assert.match((await runner.run({ prompt: '找到问题了吗', jobId: 'question', ...common })).text, /尚未确认/);
+  assert.equal(workerCount, 1);
+  const second = runner.run({ prompt: '增加另一项功能', jobId: 'two', ...common });
+  await secondStarted.promise;
+  assert.equal(workerCount, 2);
+  releaseFirst.resolve();
+  await Promise.all([first, second]);
+  assert.equal(maxLeaders, 1);
+  assert.ok(calls.filter(call => call.role === 'leader').slice(1).every(call => call.sessionId === 'leader-session'));
+});
+
+test('cancelling one task does not cancel another concurrently running task', async t => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let count = 0;
+  const { runner } = await fixture(t, {
+    async workerRun() {
+      count++;
+      if (count === 2) entered.resolve();
+      await release.promise;
+      return { text: '完成' };
+    },
+  });
+  const one = runner.run({ prompt: '任务一', jobId: 'one' });
+  const two = runner.run({ prompt: '任务二', jobId: 'two' });
+  await entered.promise;
+  assert.equal(runner.cancel('one'), true);
+  release.resolve();
+  await assert.rejects(one, { code: 'TEAM_CANCELLED' });
+  assert.match((await two).text, /汇报/);
+});
+
+test('cancelling a queued leader turn does not let another turn overlap the active one', async t => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let active = 0;
+  let maxActive = 0;
+  let plans = 0;
+  const { runner } = await fixture(t, {
+    async leaderRun(args) {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      if (!args.prompt.includes('继续作为协作负责人') && ++plans === 1) {
+        entered.resolve();
+        await release.promise;
+      }
+      active--;
+      return { text: '完成', sessionId: 'leader-session' };
+    },
+  });
+  const one = runner.run({ prompt: '第一项', jobId: 'one' });
+  await entered.promise;
+  const two = runner.run({ prompt: '第二项', jobId: 'two' });
+  const cancelled = assert.rejects(two, { code: 'TEAM_CANCELLED' });
+  const three = runner.run({ prompt: '第三项', jobId: 'three' });
+  assert.equal(runner.cancel('two'), true);
+  await cancelled;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(plans, 1);
+  release.resolve();
+  await Promise.all([one, three]);
+  assert.equal(maxActive, 1);
 });

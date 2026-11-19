@@ -1,10 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 
 const MAX_PROCESSED = 2000;
 const MAX_TEXT = 12000;
-const HELP = '直接发送文字任务即可连续对话。\n/new — 开始新对话\n/status — 查看状态\n/help — 查看帮助\n电脑和本地程序需要保持运行。';
+const HELP = '发送文字、图片或图文消息即可连续对话。\n/new — 开始新对话\n/status — 查看状态\n/help — 查看帮助\n电脑和本地程序需要保持运行。';
+const IMAGE_PROMPT = '请描述这条消息中的图片。';
 const TEAM_COMMAND = /^\/协作(?:\s+([\s\S]*))?$/;
 const TEAM_FAILURES = new Map([
   ['TEAM_PLAN_FAILED', '负责人规划未完成'],
@@ -35,7 +38,48 @@ function validateState(value) {
   };
 }
 
-/** Routes Feishu events to one local Codex worker. No message text is persisted. */
+function parseParagraphs(paragraphs) {
+  const lines = [];
+  const imageKeys = [];
+  for (const paragraph of Array.isArray(paragraphs) ? paragraphs : []) {
+    if (!Array.isArray(paragraph)) continue;
+    let line = '';
+    for (const node of paragraph) {
+      if (node?.tag === 'img' && typeof node.image_key === 'string' && node.image_key.trim()) {
+        imageKeys.push(node.image_key);
+      } else if (node?.tag !== 'at' && typeof node?.text === 'string') {
+        line += node.text;
+      }
+    }
+    if (line.trim()) lines.push(line);
+  }
+  return { lines, imageKeys };
+}
+
+function parseMessage(message) {
+  let body;
+  try { body = JSON.parse(message.content); } catch { return; }
+  if (message.message_type === 'text' && typeof body?.text === 'string') {
+    return { text: body.text, imageKeys: [] };
+  }
+  if (message.message_type === 'image' && typeof body?.image_key === 'string' && body.image_key.trim()) {
+    return { text: '', imageKeys: [body.image_key] };
+  }
+  if (message.message_type !== 'post' || !body || typeof body !== 'object') return;
+
+  const post = [body, body.zh_cn, body.en_us, ...Object.values(body)]
+    .find(locale => Array.isArray(locale?.content) || Array.isArray(locale?.content_v2));
+  if (!post) return;
+  const current = parseParagraphs(post.content_v2);
+  const legacy = parseParagraphs(post.content);
+  const title = typeof post.title === 'string' ? post.title.trim() : '';
+  return {
+    text: [title, ...(current.lines.length ? current.lines : legacy.lines)].filter(Boolean).join('\n'),
+    imageKeys: [...new Set([...legacy.imageKeys, ...current.imageKeys])],
+  };
+}
+
+/** Routes Feishu events to one local Codex worker, with images staged only for active jobs. */
 export class Bot {
   #teamReservation;
 
@@ -64,6 +108,7 @@ export class Bot {
     this.maxQueue = maxQueue;
     this.queue = [];
     this.current = null;
+    this.teamJobs = new Set();
     this.pendingReplies = new Set();
     this.idleWaiters = new Set();
     this.closed = false;
@@ -89,7 +134,7 @@ export class Bot {
   get canAcceptTeamWork() { return !this.closed && !this.failed; }
 
   get #isIdle() {
-    return !this.draining && !this.scheduled && !this.queue.length && !this.pendingReplies.size && !this.#teamReservation;
+    return !this.draining && !this.scheduled && !this.queue.length && !this.teamJobs.size && !this.pendingReplies.size && !this.#teamReservation;
   }
 
   reserveForTeam() {
@@ -142,10 +187,18 @@ export class Bot {
   }
 
   cancelCurrentJob() {
-    if (!this.current) return;
-    this.current.cancelled = true;
-    const runner = this.current.team ? this.teamRunner : this.runner;
-    try { runner.cancel(); } catch { /* The worker may already have exited. */ }
+    if (this.current) {
+      this.current.cancelled = true;
+      if (this.current.downloadController) this.current.downloadController.abort();
+      else try { this.runner.cancel(); } catch { /* Already stopped. */ }
+    }
+    for (const job of this.teamJobs) this.cancelTeamJob(job);
+  }
+
+  cancelTeamJob(job) {
+    job.cancelled = true;
+    if (job.downloadController) job.downloadController.abort();
+    else try { this.teamRunner.cancel(job.messageId); } catch { /* Already stopped. */ }
   }
 
   /** Intentionally returns immediately: SDK event acknowledgement must not await a task. */
@@ -178,16 +231,15 @@ export class Bot {
       return;
     }
 
-    let text;
-    if (message.message_type === 'text') {
-      try { text = JSON.parse(message.content).text; } catch { /* Reply with the text-only guidance below. */ }
-    }
-    if (typeof text !== 'string') {
+    const parsed = this.state.ownerOpenId || message.message_type === 'text' ? parseMessage(message) : undefined;
+    if (!parsed) {
       void this.reply(messageId, this.state.ownerOpenId
-        ? '目前支持文字消息，请把任务描述以文字发送给我。'
+        ? '请发送文字消息、图片或图文消息。'
         : '请先在飞书私聊中绑定机器人。绑定码可在运行程序的本机终端查看。');
       return;
     }
+    let { text } = parsed;
+    const { imageKeys } = parsed;
     for (const mention of mentions) {
       if (typeof mention?.key === 'string' && mention.key) text = text.split(mention.key).join('');
     }
@@ -225,7 +277,7 @@ export class Bot {
     } else if (text === '/help') {
       void this.reply(messageId, this.helpText);
     } else if (text === '/status') {
-      const current = this.#teamReservation ? '正在执行协作任务' : this.current ? '正在处理任务' : '空闲';
+      const current = this.teamJobs.size ? `正在处理 ${this.teamJobs.size} 项协作任务` : this.#teamReservation ? '正在执行协作任务' : this.current ? '正在处理任务' : '空闲';
       const context = this.state.sessions[key] ? '已有连续对话' : '新对话';
       void this.reply(messageId, `机器人：${this.workerLabel}\n状态：${current}\n等待任务：${this.queue.length}\n当前会话：${context}`);
     } else if (text === '/stop') {
@@ -233,27 +285,38 @@ export class Bot {
       this.queue = this.queue.filter(job => job.key !== key);
       const removed = before - this.queue.length;
       const active = this.current?.key === key;
-      if (active) this.cancelCurrentJob();
+      const downloading = active && this.current.downloadController;
+      if (active) {
+        this.current.cancelled = true;
+        if (downloading) downloading.abort();
+        else try { this.runner.cancel(); } catch { /* Already stopped. */ }
+      }
+      const activeTeam = [...this.teamJobs].filter(job => job.key === key);
+      for (const job of activeTeam) this.cancelTeamJob(job);
       const cancelled = `已取消 ${removed} 条等待任务。`;
-      if (active) void this.reply(messageId, '已停止当前会话的本机 Codex 进程。' + cancelled);
+      if (downloading && !activeTeam.length) void this.reply(messageId, '已停止当前会话的图片下载。' + cancelled);
+      else if (active || activeTeam.length) void this.reply(messageId, '已停止当前会话的本机 Codex 进程。' + cancelled);
       else void this.reply(messageId, removed ? cancelled : '当前会话没有正在执行或等待的任务。');
       this.notifyIdle();
     } else if (teamCommand && !this.teamRunner) {
       void this.reply(messageId, '请在指定群 @ 负责人并直接发任务。');
     } else if (teamCommand && !inTeamGroup) {
       void this.reply(messageId, '协作仅在配置的群聊中可用，请在该群 @ 我。');
-    } else if (teamCommand && !teamTask) {
+    } else if (teamCommand && !teamTask && !imageKeys.length) {
       void this.reply(messageId, `请在 /协作 后写任务，例如：@${this.workerLabel} /协作 写一份机器人使用说明。`);
-    } else if (!text) {
-      void this.reply(messageId, '请发送文字任务，或发送 /help 查看命令。');
+    } else if (!text && !imageKeys.length) {
+      void this.reply(messageId, '请发送文字或图片，或发送 /help 查看命令。');
     } else if (text.length > MAX_TEXT) {
       void this.reply(messageId, `消息过长，请分成不超过 ${MAX_TEXT} 字符的文字发送。`);
-    } else if (this.queue.length + (this.current ? 1 : 0) >= this.maxQueue) {
+    } else if (text === '/new' && ([...this.teamJobs].some(job => job.key === key) || this.queue.some(job => job.team && job.key === key))) {
+      void this.reply(messageId, '当前会话仍有协作任务，请等任务完成或发送 /stop 后再开始新对话。');
+    } else if (this.queue.length + this.teamJobs.size + (this.current ? 1 : 0) >= this.maxQueue) {
       void this.reply(messageId, '等待队列已满，请稍后再发送任务。');
     } else {
       const reset = text === '/new';
       this.queue.push({
-        messageId, key, text: teamTask ?? text, team: inTeamGroup && !reset, reset, cancelled: false,
+        messageId, key, text: (teamCommand ? teamTask : text) || IMAGE_PROMPT, imageKeys,
+        team: inTeamGroup && !reset, reset, cancelled: false,
       });
       this.scheduleDrain();
     }
@@ -274,6 +337,14 @@ export class Bot {
     try {
       while (this.queue.length && !this.closed && !this.failed) {
         const job = this.queue.shift();
+        if (job.team) {
+          this.teamJobs.add(job);
+          void this.processJob(job).catch(() => this.log('任务处理异常，已结束此任务。')).finally(() => {
+            this.teamJobs.delete(job);
+            this.notifyIdle();
+          });
+          continue;
+        }
         this.current = job;
         try { await this.processJob(job); }
         catch { this.log('任务处理异常，已结束此任务。'); }
@@ -294,19 +365,52 @@ export class Bot {
       return;
     }
     await this.reply(job.messageId, job.team
-      ? `已收到协作任务。${this.workerLabel} 正在规划，随后会安排执行。`
+      ? `已收到，${this.workerLabel} 正在处理。`
       : `已收到，正在由${this.workerLabel}处理。`);
     if (job.cancelled || this.closed || this.failed) return;
     // Confirm persistence is still writable immediately before submitting a task.
     try { this.persist(); } catch { this.failState(job.messageId); return; }
-    if (job.team) {
-      await this.processTeamJob(job);
-      return;
+
+    let directory;
+    let images;
+    try {
+      if (job.imageKeys.length) {
+        const controller = new AbortController();
+        job.downloadController = controller;
+        try {
+          directory = await mkdtemp(resolve(tmpdir(), 'feishu-codex-images-'));
+          images = [];
+          for (const key of job.imageKeys) {
+            controller.signal.throwIfAborted();
+            images.push(await this.messenger.downloadImage(job.messageId, key, directory, { signal: controller.signal }));
+          }
+        } catch (error) {
+          if (job.cancelled || this.closed || this.failed) return;
+          const reason = error?.code === 'FEISHU_IMAGE_DOWNLOAD' ? error.message : '本机无法准备图片，请检查运行环境。';
+          await this.reply(job.messageId, `无法处理图片。${reason}`);
+          return;
+        } finally {
+          job.downloadController = undefined;
+        }
+      }
+      if (job.cancelled || this.closed || this.failed) return;
+      if (job.team) await this.processTeamJob(job, images);
+      else await this.processCodexJob(job, images);
+    } finally {
+      if (directory) {
+        await rm(directory, { recursive: true, force: true }).catch(() => {
+          this.log('无法清理本次任务的临时图片。');
+        });
+      }
     }
+  }
+
+  async processCodexJob(job, images) {
     try {
       const result = await this.runner.run({
         prompt: this.persona ? `机器人角色配置：\n${this.persona}\n\n飞书用户消息：\n${job.text}` : job.text,
         sessionId: this.state.sessions[job.key],
+        ...(images && { images }),
         onThread: id => {
           if (job.cancelled || this.closed || this.failed) return;
           if (typeof id !== 'string' || !id || id.length > 200) {
@@ -335,7 +439,7 @@ export class Bot {
     }
   }
 
-  async processTeamJob(job) {
+  async processTeamJob(job, images) {
     const stageMessages = new Map([
       ['waiting', '规划已完成，执行机器人都在忙，正在等待空闲。'],
       ['review', `执行已完成，${this.workerLabel} 正在审查结果。`],
@@ -344,7 +448,10 @@ export class Bot {
     try {
       const result = await this.teamRunner.run({
         prompt: job.text,
+        jobId: job.messageId,
         sessionId: this.state.sessions[job.key],
+        ...(images && { images }),
+        getSession: () => this.state.sessions[job.key],
         onThread: id => {
           if (job.cancelled || this.closed || this.failed) return;
           if (typeof id !== 'string' || !id || id.length > 200) {

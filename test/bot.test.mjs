@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { Bot } from '../src/bot.mjs';
 
 let messageCounter = 0;
@@ -18,6 +18,14 @@ function event(text, options = {}) {
       mentions: options.mentions ?? [],
     },
   };
+}
+
+function imageEvent(imageKey, options) {
+  return event('', { ...options, type: 'image', content: JSON.stringify({ image_key: imageKey }) });
+}
+
+function postEvent(post, options) {
+  return event('', { ...options, type: 'post', content: JSON.stringify(post) });
 }
 
 function deferred() {
@@ -247,7 +255,7 @@ test('a collaboration reservation blocks direct execution and leaves unrelated s
   assert.equal(bot.reserveForTeam(), undefined);
 });
 
-test('queue is bounded, text-only inputs are enforced, and failed replies do not block execution', async t => {
+test('queue is bounded, invalid messages are rejected, and failed replies do not block execution', async t => {
   const started = deferred();
   const active = deferred();
   let calls = 0;
@@ -275,6 +283,133 @@ test('queue is bounded, text-only inputs are enforced, and failed replies do not
   assert.equal(messages.at(-1).text, 'done');
   assert.ok(logs.length > 0);
   assert.ok(!JSON.stringify(logs).includes('SECRET'));
+});
+
+test('private images reach a new Codex turn and the same conversation can receive a fresh image', async t => {
+  const downloads = [];
+  const { bot, messenger, stateFile, replies } = fixture(t, {
+    runner: {
+      async run({ prompt, sessionId, images, onThread }) {
+        assert.equal(images.length, 1);
+        const text = readFileSync(images[0], 'utf8');
+        turns.push({ prompt, sessionId, text });
+        onThread('image-thread');
+        return { text, sessionId: 'image-thread' };
+      },
+      cancel() { return false; },
+    },
+  });
+  const turns = [];
+  messenger.downloadImage = async (messageId, key, directory) => {
+    downloads.push({ messageId, key, directory });
+    if (process.platform !== 'win32') assert.equal(statSync(directory).mode & 0o777, 0o700);
+    const path = join(directory, 'attachment.png');
+    writeFileSync(path, key === 'img_first' ? 'A6K4Q' : 'T9M2V');
+    return path;
+  };
+  await bind(bot);
+  const first = imageEvent('img_first');
+  assert.equal(bot.handleEvent(first), undefined);
+  assert.equal(downloads.length, 0);
+  await bot.idle();
+  assert.equal(replies.at(-1).text, 'A6K4Q');
+  const second = postEvent({ zh_cn: {
+    title: '下一张',
+    content: [[{ tag: 'img', image_key: 'img_second' }]],
+    content_v2: [[{ tag: 'md', text: '这张图里的短码是什么？' }], [{ tag: 'img', image_key: 'img_second' }]],
+  } });
+  bot.handleEvent(second);
+  await bot.idle();
+
+  assert.deepEqual(turns, [
+    { prompt: '请描述这条消息中的图片。', sessionId: undefined, text: 'A6K4Q' },
+    { prompt: '下一张\n这张图里的短码是什么？', sessionId: 'image-thread', text: 'T9M2V' },
+  ]);
+  assert.equal(replies.at(-1).text, 'T9M2V');
+  assert.deepEqual(downloads.map(({ messageId, key }) => [messageId, key]), [
+    [first.message.message_id, 'img_first'], [second.message.message_id, 'img_second'],
+  ]);
+  assert.notEqual(downloads[0].directory, downloads[1].directory);
+  const state = readFileSync(stateFile, 'utf8');
+  for (const { directory, key } of downloads) {
+    assert.equal(existsSync(directory), false);
+    assert.ok(!state.includes(directory) && !state.includes(key));
+  }
+});
+
+test('an image download failure prevents execution and cleans already downloaded attachments', async t => {
+  const { bot, calls, messenger, replies } = fixture(t);
+  let partial;
+  messenger.downloadImage = async (_messageId, key, directory) => {
+    if (key === 'img_denied') {
+      throw Object.assign(new Error('飞书没有授予读取图片的权限。'), { code: 'FEISHU_IMAGE_DOWNLOAD' });
+    }
+    partial = join(directory, 'partial.png');
+    writeFileSync(partial, 'first image');
+    return partial;
+  };
+  await bind(bot);
+  bot.handleEvent(postEvent({ content: [
+    [{ tag: 'text', text: '比较两张图' }],
+    [{ tag: 'img', image_key: 'img_ok' }],
+    [{ tag: 'img', image_key: 'img_denied' }],
+  ] }));
+  await bot.idle();
+  assert.deepEqual(calls, []);
+  assert.match(replies.at(-1).text, /读取图片的权限/);
+  assert.equal(existsSync(dirname(partial)), false);
+});
+
+test('/stop aborts an active image download and discards queued images before downloading them', async t => {
+  const started = deferred();
+  const { bot, calls, messenger, replies } = fixture(t);
+  const downloads = [];
+  let temporary;
+  messenger.downloadImage = async (_messageId, key, directory, { signal }) => {
+    downloads.push(key);
+    temporary = directory;
+    writeFileSync(join(directory, 'partial.png'), 'partial image');
+    started.resolve();
+    await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  };
+  await bind(bot);
+  bot.handleEvent(imageEvent('img_active'));
+  await started.promise;
+  bot.handleEvent(imageEvent('img_queued'));
+  bot.handleEvent(event('/stop'));
+  await bot.idle();
+  assert.deepEqual(downloads, ['img_active']);
+  assert.deepEqual(calls, []);
+  assert.equal(existsSync(temporary), false);
+  assert.match(replies.at(-1).text, /已停止当前会话的图片下载。已取消 1 条等待任务。/);
+  assert.ok(!replies.some(reply => /无法处理图片/.test(reply.text)));
+});
+
+test('staged images stay available until a cancelled Codex turn settles', async t => {
+  const started = deferred();
+  const stopped = deferred();
+  const result = deferred();
+  const { bot, messenger, replies } = fixture(t, {
+    runner: {
+      async run({ images }) { started.resolve(images[0]); return result.promise; },
+      cancel() { stopped.resolve(); return true; },
+    },
+  });
+  messenger.downloadImage = async (_messageId, _key, directory) => {
+    const path = join(directory, 'attachment.png');
+    writeFileSync(path, 'image data');
+    return path;
+  };
+  await bind(bot);
+  bot.handleEvent(imageEvent('img_running'));
+  const path = await started.promise;
+  bot.handleEvent(event('/stop'));
+  await stopped.promise;
+  assert.equal(existsSync(path), true);
+  result.resolve({ text: '晚到结果' });
+  await bot.idle();
+  assert.equal(existsSync(dirname(path)), false);
+  assert.ok(!replies.some(reply => /晚到结果/.test(reply.text)));
 });
 
 test('corrupt state fails closed without overwriting the file', t => {
@@ -366,6 +501,52 @@ function teamEvent(task, overrides = {}) {
   return event(`@_user_1 /协作 ${task}`, { ...teamGroup, ...overrides });
 }
 
+test('only a bound, mentioned, unique group post downloads and routes its original images to teamwork', async t => {
+  const taskCalls = [];
+  const downloads = [];
+  const { bot, calls, messenger } = fixture(t, {
+    teamChatId: teamGroup.chat,
+    teamRunner: {
+      async run({ prompt, images }) {
+        taskCalls.push({ prompt, images, contents: images.map(path => readFileSync(path, 'utf8')) });
+        return { text: '团队结果' };
+      },
+      cancel() { return false; },
+    },
+  });
+  messenger.downloadImage = async (messageId, key, directory) => {
+    downloads.push({ messageId, key, directory });
+    const path = join(directory, `${key}.png`);
+    writeFileSync(path, key);
+    return path;
+  };
+  const post = { title: '', content: [
+    [{ tag: 'at', user_id: '@_user_1', user_name: 'Leader' }, { tag: 'text', text: ' 比较这两张截图。' }],
+    [{ tag: 'img', image_key: 'img_left' }],
+    [{ tag: 'img', image_key: 'img_right' }],
+  ] };
+  bot.handleEvent(postEvent(post, teamGroup));
+  await bot.idle();
+  assert.deepEqual(downloads, []);
+  await bind(bot);
+  bot.handleEvent(postEvent(post, { ...teamGroup, sender: 'ou_other' }));
+  bot.handleEvent(postEvent(post, { ...teamGroup, mentions: [] }));
+  const accepted = postEvent(post, teamGroup);
+  bot.handleEvent(accepted);
+  bot.handleEvent(accepted);
+  await bot.idle();
+
+  assert.deepEqual(calls, []);
+  assert.equal(taskCalls.length, 1);
+  assert.equal(taskCalls[0].prompt, '比较这两张截图。');
+  assert.deepEqual(taskCalls[0].contents, ['img_left', 'img_right']);
+  assert.deepEqual(downloads.map(({ messageId, key }) => [messageId, key]), [
+    [accepted.message.message_id, 'img_left'], [accepted.message.message_id, 'img_right'],
+  ]);
+  assert.equal(downloads[0].directory, downloads[1].directory);
+  assert.equal(existsSync(downloads[0].directory), false);
+});
+
 test('team conversation saves its leader session and reuses it for the next request until reset', async t => {
   const seen = [];
   const { bot, stateFile } = fixture(t, {
@@ -406,9 +587,10 @@ test('ordinary mentions default to teamwork only for the paired owner in the con
     teamRunner: {
       async run({ prompt, onStage }) {
         tasks.push(prompt);
+        const index = tasks.length;
         await onStage('plan');
-        if (tasks.length === 1) await onStage('waiting');
-        await onStage('execute', tasks.length === 1 ? 'Worker 2' : 'Worker 1');
+        if (index === 1) await onStage('waiting');
+        await onStage('execute', index === 1 ? 'Worker 2' : 'Worker 1');
         await onStage('review');
         return { text: '团队结果' };
       },
@@ -446,14 +628,15 @@ test('ordinary mentions default to teamwork only for the paired owner in the con
   assert.ok(replies.some(reply => reply.text.includes('请在 /协作 后写任务')));
   const acceptedReplies = replies.filter(reply => reply.messageId === accepted.message.message_id);
   assert.deepEqual(acceptedReplies.map(reply => reply.text), [
-    '已收到协作任务。Leader 正在规划，随后会安排执行。',
+    '已收到，Leader 正在处理。',
     '规划已完成，执行机器人都在忙，正在等待空闲。',
     '规划已完成，Worker 2 正在执行。',
     '执行已完成，Leader 正在审查结果。',
     '协作汇报\n团队结果',
   ]);
   const completed = ['协作开始：规划/执行/审查。', '协作完成，结果已回复飞书。'];
-  assert.deepEqual(info, [...completed, ...completed]);
+  assert.deepEqual(info.filter(line => line === completed[0]), [completed[0], completed[0]]);
+  assert.deepEqual(info.filter(line => line === completed[1]), [completed[1], completed[1]]);
 });
 
 test('the leader keeps control commands out of the default team workflow', async t => {
@@ -580,4 +763,47 @@ test('team failure reports a safe stage and does not forward raw errors', async 
   assert.match(replies.at(-1).text, /协作未完成：执行者未完成任务/);
   assert.ok(!replies.some(reply => reply.text.includes('SECRET')));
   assert.ok(!logs.some(message => message.includes('SECRET')));
+});
+
+test('a busy team task does not block a follow-up and a second task', async t => {
+  const started = deferred();
+  const finish = deferred();
+  const seen = [];
+  const { bot, replies } = fixture(t, {
+    teamChatId: teamGroup.chat,
+    teamRunner: {
+      async run({ prompt }) {
+        seen.push(prompt);
+        if (prompt === '第一个任务') { started.resolve(); await finish.promise; }
+        return { text: `完成：${prompt}` };
+      },
+      cancel() { finish.resolve(); return true; },
+    },
+  });
+  await bind(bot);
+  bot.handleEvent(event('@_user_1 第一个任务', teamGroup));
+  await started.promise;
+  bot.handleEvent(event('@_user_1 找到问题了吗', teamGroup));
+  bot.handleEvent(event('@_user_1 第二个任务', teamGroup));
+  for (let i = 0; i < 20 && seen.length < 3; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(seen, ['第一个任务', '找到问题了吗', '第二个任务']);
+  assert.ok(replies.some(reply => reply.text.includes('找到问题了吗')));
+  finish.resolve();
+  await bot.idle();
+});
+
+test('a new session is refused when collaboration is queued or running', async t => {
+  const finish = deferred();
+  const { bot, replies } = fixture(t, {
+    teamChatId: teamGroup.chat,
+    teamRunner: { async run() { await finish.promise; return { text: '完成' }; }, cancel() { finish.resolve(); } },
+  });
+  await bind(bot);
+  bot.handleEvent(event('@_user_1 开始任务', teamGroup));
+  const reset = event('@_user_1 /new', teamGroup);
+  bot.handleEvent(reset);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(replies.find(reply => reply.messageId === reset.message.message_id).text, /仍有协作任务/);
+  finish.resolve();
+  await bot.idle();
 });

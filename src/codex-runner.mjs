@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
@@ -38,21 +38,27 @@ export class CodexRunner {
     this.env = env;
   }
 
-  async run({ prompt, sessionId, onThread } = {}) {
+  async run({ prompt, sessionId, onThread, images = [] } = {}) {
     if (this.#active) throw fail('CODEX_BUSY', 'Codex 正在处理另一个任务，请稍后再试。');
     if (typeof prompt !== 'string' || !prompt.trim()) throw fail('CODEX_CONFIGURATION', '请发送非空的文字任务。');
     if (sessionId != null && (typeof sessionId !== 'string' || !UUID.test(sessionId))) {
       throw fail('CODEX_CONFIGURATION', '保存的 Codex 会话编号无效，请使用 /new 新建会话。');
     }
+    // Codex treats commas in --image values as path separators.
+    if (!Array.isArray(images) || images.some(path => typeof path !== 'string' || !isAbsolute(path) || path.includes(','))) {
+      throw fail('CODEX_CONFIGURATION', '图片附件路径无效。');
+    }
+    const imageArgs = images.flatMap(path => ['--image', path]);
     // Explicit exec-level cwd/permission overrides also apply to resumed sessions.
     // Load the user's Codex configuration, including its configured MCP servers.
-    const args = ['exec', '--json', '--skip-git-repo-check',
+    // Put image arguments before another option to keep the stdin marker positional.
+    const args = ['exec', ...(sessionId ? [] : imageArgs), '--json', '--skip-git-repo-check',
       '--color', 'never', '--cd', this.workspace, '--sandbox', this.sandbox,
       '-c', 'approval_policy="on-request"', '-c', 'approvals_reviewer="auto_review"',
       '-c', `sandbox_mode="${this.sandbox}"`];
     if (this.model) args.push('--model', this.model);
     if (this.reasoningEffort) args.push('-c', `model_reasoning_effort="${this.reasoningEffort}"`);
-    if (sessionId) args.push('resume', '--json', '--skip-git-repo-check', sessionId, '-');
+    if (sessionId) args.push('resume', ...imageArgs, '--json', '--skip-git-repo-check', sessionId, '-');
     else args.push('-');
 
     return new Promise((resolveRun, rejectRun) => {
