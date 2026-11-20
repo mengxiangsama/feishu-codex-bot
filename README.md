@@ -123,12 +123,6 @@ Codex CLI 会读取本机用户配置，包括配置的 MCP 服务器。需要�
 
 [Codex CLI 非交互模式与会话恢复](https://learn.chatgpt.com/docs/non-interactive-mode)
 
-## 相关项目
-
-- 使用**流式卡片**在飞书里实时查看 Codex 的回复。[sakepurr/feishu-codex-bridge](https://github.com/sakepurr/feishu-codex-bridge)
-- 开启「咖啡一下」后，在**手机飞书私聊**里审批本机 Codex 的请求，让任务继续。[modelzen/feishu-codex-bridge](https://github.com/modelzen/feishu-codex-bridge)
-- 在飞书里选择工作区和会话，**接续电脑上已有的 Codex 对话**。[kxn/codex-remote-feishu](https://github.com/kxn/codex-remote-feishu)
-
 ## 测试与许可证
 
 在项目目录运行 `npm test`。测试覆盖绑定、去重、会话恢复、图片下载和 Codex 子进程。使用已发布的自建应用验证识图时，可在私聊发送只有图片上写有随机短码的截图，再在同一会话发送一张不同短码的截图。在协作群中可把 @ 负责人、截图和读取短码的问题放在同一条消息里。开启免 @ 后，可直接发送「8 + 9 等于多少？」再追问「再加 1 呢？」并确认只有负责人发来回复。
